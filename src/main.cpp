@@ -934,6 +934,62 @@ std::vector<T> parallel_load(std::vector<Fs::path> paths, std::size_t parallelis
   return results;
 }
 
+template <typename Worker>
+void parallel_for(std::size_t task_count,
+                  std::size_t parallelism,
+                  std::string_view progress_name,
+                  Worker worker_fn) {
+  if (task_count == 0) {
+    return;
+  }
+
+  const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
+  std::atomic<std::size_t> next_index{0};
+  std::atomic<std::size_t> completed{0};
+  std::mutex error_mutex;
+  std::exception_ptr first_error;
+
+  auto worker = [&]() {
+    while (true) {
+      const std::size_t index = next_index.fetch_add(1);
+      if (index >= task_count) {
+        break;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (first_error) {
+          break;
+        }
+      }
+
+      try {
+        worker_fn(index);
+        const std::size_t current = completed.fetch_add(1) + 1;
+        print_progress(progress_name, current, task_count);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (!first_error) {
+          first_error = std::current_exception();
+        }
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  for (std::size_t i = 0; i < worker_count; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+
+  if (first_error) {
+    std::rethrow_exception(first_error);
+  }
+}
+
 void validate_dimensions(const std::vector<InputEntry> &entries) {
   if (entries.empty()) {
     fail("No input images available after filtering.");
@@ -1503,13 +1559,13 @@ Fs::path slice_path_for(const Fs::path &temp_dir, std::size_t index) {
 
 void dump_slices_no_alignment(const std::vector<InputEntry> &entries,
                               SliceDirection direction,
-                              const Fs::path &temp_dir) {
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    print_progress("dumping slices", i + 1, entries.size());
+                              const Fs::path &temp_dir,
+                              std::size_t parallelism) {
+  parallel_for(entries.size(), parallelism, "dumping slices", [&](std::size_t i) {
     const Image image = load_image(entries[i].path);
     const Image slice = extract_slice(image, i, entries.size(), direction);
     write_tiff(slice_path_for(temp_dir, i), slice);
-  }
+  });
 }
 
 AlignmentData compute_auto_alignment_from_entries_parallel(const std::vector<InputEntry> &entries,
@@ -1579,14 +1635,14 @@ void dump_transformed_slices(const std::vector<InputEntry> &entries,
                              SliceDirection direction,
                              bool global_crop,
                              CropRect crop_rect,
-                             const Fs::path &temp_dir) {
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    print_progress("dumping slices", i + 1, entries.size());
+                             const Fs::path &temp_dir,
+                             std::size_t parallelism) {
+  parallel_for(entries.size(), parallelism, "dumping slices", [&](std::size_t i) {
     const Image image = load_image(entries[i].path);
     const Image transformed = transform_image(image, offsets[i], global_crop, crop_rect);
     const Image slice = extract_slice(transformed, i, entries.size(), direction);
     write_tiff(slice_path_for(temp_dir, i), slice);
-  }
+  });
 }
 
 Image merge_slices_from_temp(const std::vector<InputEntry> &entries,
@@ -1675,7 +1731,7 @@ Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &e
   const int base_height = entries.front().height;
 
   if (!options.auto_align && !options.global_auto_align) {
-    dump_slices_no_alignment(entries, options.direction, temp_dir);
+    dump_slices_no_alignment(entries, options.direction, temp_dir, options.parallelism);
     return merge_slices_from_temp(entries, options.direction, temp_dir, base_width, base_height);
   }
 
@@ -1683,7 +1739,8 @@ Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &e
     const AlignmentData alignment =
         compute_auto_alignment_from_entries_parallel(entries, options.parallelism, options.align_backend);
     write_alignment_json(alignment_path, entries, alignment);
-    dump_transformed_slices(entries, alignment.total_offsets, options.direction, false, CropRect{}, temp_dir);
+    dump_transformed_slices(entries, alignment.total_offsets, options.direction, false, CropRect{},
+                            temp_dir, options.parallelism);
     return merge_slices_from_temp(entries, options.direction, temp_dir, base_width, base_height);
   }
 
@@ -1693,7 +1750,8 @@ Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &e
                                            options.align_backend);
   const CropRect crop = compute_crop_rect(base_width, base_height, alignment.total_offsets);
   write_alignment_json(alignment_path, entries, alignment);
-  dump_transformed_slices(entries, alignment.total_offsets, options.direction, true, crop, temp_dir);
+  dump_transformed_slices(entries, alignment.total_offsets, options.direction, true, crop, temp_dir,
+                          options.parallelism);
   return merge_slices_from_temp(entries, options.direction, temp_dir, crop.width, crop.height);
 }
 

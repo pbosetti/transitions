@@ -33,6 +33,7 @@ Options:
 - `--reverse`: reverse the selected order
 - `--horizontal`: use horizontal slices instead of vertical slices
 - `--auto-align`: align each image to the previous one using translation only and pad missing areas with black
+- `--align-backend <simple|phase>`: choose the alignment backend used by `--auto-align`
 - `--global-auto-align`: align the full sequence and crop to the common visible area
 - `--dump-intermediate`: save slices in `temp/` and alignment data in `temp/alignment.json` before the final merge
 - `--preview <n>`: keep `n` regularly sampled images, always including the first and the last
@@ -46,3 +47,4 @@ Notes:
 - When sorting by time, the tool uses EXIF `DateTimeOriginal` for JPEG images and LibRaw capture timestamp data for DNG images. Files without capture time fall back to filename order.
 - `--dump-intermediate` creates a `temp/` folder next to the output file and recreates it for each run.
 - Alignment JSON is written as a single object keyed by filename, with both relative and total offsets, for example: `{"file_01.jpg":{"relative":{"x":0,"y":0},"total":{"x":10,"y":12}}}`.
+- The `phase` alignment backend uses the local `src/phase_corr.*` implementation backed by FFTW and Eigen.

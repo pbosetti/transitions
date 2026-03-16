@@ -5,6 +5,8 @@
 #include <libraw/libraw.h>
 #include <tiffio.h>
 
+#include "phase_corr.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -43,9 +45,15 @@ enum class SliceDirection {
   kHorizontal,
 };
 
+enum class AlignBackend {
+  kSimple,
+  kPhaseCorr,
+};
+
 struct Options {
   SortMode sort_mode = SortMode::kCaptureTime;
   SliceDirection direction = SliceDirection::kVertical;
+  AlignBackend align_backend = AlignBackend::kSimple;
   bool reverse = false;
   bool auto_align = false;
   bool global_auto_align = false;
@@ -135,6 +143,7 @@ void print_usage(const char *argv0) {
       << "  --reverse                Reverse the selected ordering.\n"
       << "  --horizontal             Build the output from horizontal slices.\n"
       << "  --auto-align             Align each image to the previous one with black padding.\n"
+      << "  --align-backend <simple|phase> Select the alignment backend for --auto-align.\n"
       << "  --global-auto-align      Align all images, crop to common content, disable --auto-align.\n"
       << "  --dump-intermediate      Save slices and alignment data in a temp folder before merging.\n"
       << "  --preview <n>            Sample n images uniformly, always including first and last.\n"
@@ -198,6 +207,20 @@ Options parse_args(int argc, char **argv) {
     }
     if (arg == "--horizontal") {
       options.direction = SliceDirection::kHorizontal;
+      continue;
+    }
+    if (arg == "--align-backend") {
+      if (i + 1 >= argc) {
+        fail("Missing value for --align-backend.");
+      }
+      const std::string value = lowercase(argv[++i]);
+      if (value == "simple") {
+        options.align_backend = AlignBackend::kSimple;
+      } else if (value == "phase") {
+        options.align_backend = AlignBackend::kPhaseCorr;
+      } else {
+        fail("Invalid value for --align-backend: " + value);
+      }
       continue;
     }
     if (arg == "--auto-align") {
@@ -1113,6 +1136,40 @@ Offset estimate_translation(const Image &reference, const Image &candidate) {
   return best;
 }
 
+phasecorr::Image to_phasecorr_image(const Image &image) {
+  phasecorr::Image gray(image.height, image.width);
+  for (int y = 0; y < image.height; ++y) {
+    for (int x = 0; x < image.width; ++x) {
+      const std::size_t index =
+          (static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width) +
+           static_cast<std::size_t>(x)) * 3U;
+      const float r = static_cast<float>(image.pixels[index]);
+      const float g = static_cast<float>(image.pixels[index + 1]);
+      const float b = static_cast<float>(image.pixels[index + 2]);
+      gray(y, x) = 0.299f * r + 0.587f * g + 0.114f * b;
+    }
+  }
+  return gray;
+}
+
+Offset estimate_translation_phase_corr(const Image &reference, const Image &candidate) {
+  const phasecorr::Image ref_gray = to_phasecorr_image(reference);
+  const phasecorr::Image cand_gray = to_phasecorr_image(candidate);
+  const Eigen::Vector2d shift = phasecorr::phaseCorrelation(ref_gray, cand_gray);
+
+  Offset offset{};
+  offset.dx = static_cast<int>(std::llround(shift.x()));
+  offset.dy = static_cast<int>(std::llround(shift.y()));
+  return offset;
+}
+
+Offset estimate_offset(const Image &reference, const Image &candidate, AlignBackend backend) {
+  if (backend == AlignBackend::kPhaseCorr) {
+    return estimate_translation_phase_corr(reference, candidate);
+  }
+  return estimate_translation(reference, candidate);
+}
+
 std::vector<Offset> accumulate_total_offsets(const std::vector<Offset> &relative_offsets) {
   std::vector<Offset> total_offsets(relative_offsets.size(), Offset{});
   for (std::size_t i = 1; i < relative_offsets.size(); ++i) {
@@ -1124,7 +1181,8 @@ std::vector<Offset> accumulate_total_offsets(const std::vector<Offset> &relative
 
 AlignmentData compute_alignment_from_loaded_images(const std::vector<ImageInfo> &inputs,
                                                    std::size_t parallelism,
-                                                   std::string_view operation) {
+                                                   std::string_view operation,
+                                                   AlignBackend backend) {
   AlignmentData alignment{};
   alignment.relative_offsets.assign(inputs.size(), Offset{});
   if (inputs.size() <= 1) {
@@ -1153,7 +1211,7 @@ AlignmentData compute_alignment_from_loaded_images(const std::vector<ImageInfo> 
       }
 
       try {
-        const Offset delta = estimate_translation(inputs[index - 1].image, inputs[index].image);
+        const Offset delta = estimate_offset(inputs[index - 1].image, inputs[index].image, backend);
         alignment.relative_offsets[index] = delta;
         print_alignment_progress(operation, index, task_count, delta);
       } catch (...) {
@@ -1455,7 +1513,8 @@ void dump_slices_no_alignment(const std::vector<InputEntry> &entries,
 }
 
 AlignmentData compute_auto_alignment_from_entries_parallel(const std::vector<InputEntry> &entries,
-                                                           std::size_t parallelism) {
+                                                           std::size_t parallelism,
+                                                           AlignBackend backend) {
   AlignmentData alignment{};
   alignment.relative_offsets.assign(entries.size(), Offset{});
   if (entries.size() <= 1) {
@@ -1486,7 +1545,7 @@ AlignmentData compute_auto_alignment_from_entries_parallel(const std::vector<Inp
       try {
         const Image previous = load_image(entries[index - 1].path);
         const Image current = load_image(entries[index].path);
-        const Offset delta = estimate_translation(previous, current);
+        const Offset delta = estimate_offset(previous, current, backend);
         alignment.relative_offsets[index] = delta;
         print_alignment_progress("auto alignment", index, task_count, delta);
       } catch (...) {
@@ -1574,7 +1633,8 @@ Image run_in_memory_pipeline(const Options &options, const std::vector<InputEntr
 
   if (options.global_auto_align) {
     const AlignmentData alignment =
-        compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment");
+        compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment",
+                                             options.align_backend);
     const CropRect crop = compute_crop_rect(inputs.front().image.width, inputs.front().image.height,
                                             alignment.total_offsets);
     std::vector<Image> images;
@@ -1588,7 +1648,8 @@ Image run_in_memory_pipeline(const Options &options, const std::vector<InputEntr
 
   if (options.auto_align) {
     const AlignmentData alignment =
-        compute_alignment_from_loaded_images(inputs, options.parallelism, "auto alignment");
+        compute_alignment_from_loaded_images(inputs, options.parallelism, "auto alignment",
+                                             options.align_backend);
     std::vector<Image> images;
     images.reserve(inputs.size());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
@@ -1619,7 +1680,8 @@ Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &e
   }
 
   if (options.auto_align) {
-    const AlignmentData alignment = compute_auto_alignment_from_entries_parallel(entries, options.parallelism);
+    const AlignmentData alignment =
+        compute_auto_alignment_from_entries_parallel(entries, options.parallelism, options.align_backend);
     write_alignment_json(alignment_path, entries, alignment);
     dump_transformed_slices(entries, alignment.total_offsets, options.direction, false, CropRect{}, temp_dir);
     return merge_slices_from_temp(entries, options.direction, temp_dir, base_width, base_height);
@@ -1627,7 +1689,8 @@ Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &e
 
   std::vector<ImageInfo> inputs = load_selected_images(entries, options.parallelism);
   const AlignmentData alignment =
-      compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment");
+      compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment",
+                                           options.align_backend);
   const CropRect crop = compute_crop_rect(base_width, base_height, alignment.total_offsets);
   write_alignment_json(alignment_path, entries, alignment);
   dump_transformed_slices(entries, alignment.total_offsets, options.direction, true, crop, temp_dir);

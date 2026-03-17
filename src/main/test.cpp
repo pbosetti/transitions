@@ -25,7 +25,8 @@ int main() {
     }
   }
 
-  const auto shift = phasecorr::phaseCorrelation(a, b);
+  const auto result = phasecorr::phaseCorrelation(a, b);
 
-  std::cout << "Estimated shift: " << shift.transpose() << std::endl;
+  std::cout << "Estimated shift: " << result.shift.transpose() << ", peak=" << result.peak
+            << std::endl;
 }

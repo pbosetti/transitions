@@ -5,6 +5,11 @@
 
 namespace phasecorr {
 
-Eigen::Vector2d phaseCorrelation(const Image &a, const Image &b);
+struct PhaseCorrelationResult {
+  Eigen::Vector2d shift = Eigen::Vector2d::Zero();
+  double peak = 0.0;
+};
+
+PhaseCorrelationResult phaseCorrelation(const Image &a, const Image &b);
 
 }  // namespace phasecorr

@@ -31,6 +31,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
 pkg_check_modules(LIBRAW REQUIRED IMPORTED_TARGET libraw_r)
 pkg_check_modules(LIBTIFF REQUIRED IMPORTED_TARGET libtiff-4)
+pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json)
 
 add_executable(transitions
   src/main.cpp
@@ -51,6 +52,7 @@ target_link_libraries(transitions PRIVATE
   PkgConfig::LIBJPEG
   PkgConfig::LIBRAW
   PkgConfig::LIBTIFF
+  PkgConfig::NLOHMANN_JSON
   Eigen3::Eigen
   fftw3f
 )

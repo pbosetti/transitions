@@ -3,6 +3,7 @@
 
 #include <jpeglib.h>
 #include <libraw/libraw.h>
+#include <nlohmann/json.hpp>
 #include <tiffio.h>
 
 #include "phase_corr.hpp"
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <numbers>
 #include <optional>
+#include <memory>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -66,13 +68,13 @@ struct Options {
   SliceDirection direction = SliceDirection::kVertical;
   bool reverse = false;
   bool auto_align = false;
-  bool global_auto_align = false;
-  bool dump_intermediate = false;
+  bool pad_result = false;
   int jpeg_quality = 95;
   std::size_t parallelism = 1;
   std::size_t preview_count = 0;
   Fs::path input_dir;
   Fs::path output_path;
+  Fs::path alignment_json_path;
 };
 
 struct Timestamp {
@@ -98,11 +100,6 @@ struct InputEntry {
   std::optional<Timestamp> capture_time;
   int width = 0;
   int height = 0;
-};
-
-struct ImageInfo {
-  InputEntry entry;
-  Image image;
 };
 
 struct Offset {
@@ -153,6 +150,26 @@ void print_alignment_progress(std::string_view operation, std::size_t current, s
             << "deg" << std::defaultfloat << std::endl;
 }
 
+void print_progress_percent_5(std::string_view operation,
+                              std::size_t completed,
+                              std::size_t total,
+                              std::size_t &last_percent_bucket) {
+  if (total == 0) {
+    return;
+  }
+
+  const std::size_t current_percent = (completed * 100U) / total;
+  const std::size_t bucket = std::min<std::size_t>(100, (current_percent / 5U) * 5U);
+  if (bucket <= last_percent_bucket && completed != total) {
+    return;
+  }
+
+  last_percent_bucket = bucket;
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::cout << operation << ": " << bucket << '%' << std::endl;
+}
+
 void print_usage(const char *argv0) {
   std::cout
       << "Usage: " << argv0 << " [options] <input_dir> <output.{jpg,tif}>\n"
@@ -160,9 +177,9 @@ void print_usage(const char *argv0) {
       << "  --sort <name|time>       Sort input files by filename or capture time (default: time).\n"
       << "  --reverse                Reverse the selected ordering.\n"
       << "  --horizontal             Build the output from horizontal slices.\n"
-      << "  --auto-align             Align each image to the previous one with black padding.\n"
-      << "  --global-auto-align      Align all images, crop to common content, disable --auto-align.\n"
-      << "  --dump-intermediate      Save slices and alignment data in a temp folder before merging.\n"
+      << "  --auto-align             Align each image to the previous one.\n"
+      << "  --pad-result             Keep padded output after alignment instead of cropping.\n"
+      << "  --alignment-json <path>  Reuse an existing alignment checkpoint or write a new one there.\n"
       << "  --preview <n>            Sample n images uniformly, always including first and last.\n"
       << "  --parallel <n>           Load input images using n threads (default: 1).\n"
       << "  --quality <1-100>        JPEG quality for JPEG output only (default: 95).\n"
@@ -230,13 +247,19 @@ Options parse_args(int argc, char **argv) {
       options.auto_align = true;
       continue;
     }
-    if (arg == "--global-auto-align") {
-      options.global_auto_align = true;
-      options.auto_align = false;
+    if (arg == "--pad-result") {
+      options.pad_result = true;
       continue;
     }
-    if (arg == "--dump-intermediate") {
-      options.dump_intermediate = true;
+    if (arg == "--alignment-json") {
+      if (i + 1 >= argc) {
+        fail("Missing value for --alignment-json.");
+      }
+      options.alignment_json_path = argv[++i];
+      continue;
+    }
+    if (arg.rfind("--alignment-json=", 0) == 0) {
+      options.alignment_json_path = std::string_view(arg).substr(17);
       continue;
     }
     if (arg == "--preview") {
@@ -779,48 +802,6 @@ Image load_image(const Fs::path &path) {
   fail("Unsupported file type: " + path.string());
 }
 
-void write_jpeg(const Fs::path &path, const Image &image, int quality) {
-  std::lock_guard<std::mutex> lock(jpeg_mutex());
-  FILE *file = std::fopen(path.string().c_str(), "wb");
-  if (file == nullptr) {
-    fail("Unable to open output file: " + path.string());
-  }
-
-  jpeg_compress_struct cinfo{};
-  JpegErrorManager jerr{};
-  cinfo.err = jpeg_std_error(&jerr.base);
-  jerr.base.error_exit = jpeg_error_exit;
-
-  if (setjmp(jerr.jump_buffer) != 0) {
-    jpeg_destroy_compress(&cinfo);
-    std::fclose(file);
-    fail("Failed to write JPEG file: " + path.string());
-  }
-
-  jpeg_create_compress(&cinfo);
-  jpeg_stdio_dest(&cinfo, file);
-
-  cinfo.image_width = static_cast<JDIMENSION>(image.width);
-  cinfo.image_height = static_cast<JDIMENSION>(image.height);
-  cinfo.input_components = 3;
-  cinfo.in_color_space = JCS_RGB;
-
-  jpeg_set_defaults(&cinfo);
-  jpeg_set_quality(&cinfo, quality, TRUE);
-  jpeg_start_compress(&cinfo, TRUE);
-
-  const std::size_t row_stride = static_cast<std::size_t>(image.width) * 3U;
-  while (cinfo.next_scanline < cinfo.image_height) {
-    auto *row = const_cast<JSAMPLE *>(image.pixels.data() + row_stride * cinfo.next_scanline);
-    JSAMPROW rows[] = {row};
-    jpeg_write_scanlines(&cinfo, rows, 1);
-  }
-
-  jpeg_finish_compress(&cinfo);
-  jpeg_destroy_compress(&cinfo);
-  std::fclose(file);
-}
-
 void write_tiff(const Fs::path &path, const Image &image) {
   std::lock_guard<std::mutex> lock(tiff_mutex());
   TIFF *tiff = TIFFOpen(path.string().c_str(), "w");
@@ -852,19 +833,6 @@ void write_tiff(const Fs::path &path, const Image &image) {
   }
 
   TIFFClose(tiff);
-}
-
-void write_output(const Fs::path &path, const Image &image, int jpeg_quality) {
-  const std::string extension = lowercase(path.extension().string());
-  if (extension == ".jpg" || extension == ".jpeg") {
-    write_jpeg(path, image, jpeg_quality);
-    return;
-  }
-  if (extension == ".tif" || extension == ".tiff") {
-    write_tiff(path, image);
-    return;
-  }
-  fail("Unsupported output format. Use .jpg, .jpeg, .tif, or .tiff.");
 }
 
 std::vector<Fs::path> list_input_files(const Fs::path &input_dir) {
@@ -1050,24 +1018,6 @@ std::vector<InputEntry> gather_inputs(const Options &options) {
   return entries;
 }
 
-std::vector<ImageInfo> load_selected_images(const std::vector<InputEntry> &entries, std::size_t parallelism) {
-  std::vector<Fs::path> paths;
-  paths.reserve(entries.size());
-  for (const auto &entry : entries) {
-    paths.push_back(entry.path);
-  }
-
-  std::vector<Image> images =
-      parallel_load<Image>(std::move(paths), parallelism, "loading images", load_image);
-
-  std::vector<ImageInfo> result(entries.size());
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    result[i].entry = entries[i];
-    result[i].image = std::move(images[i]);
-  }
-  return result;
-}
-
 phasecorr::Image to_phasecorr_image(const Image &image) {
   phasecorr::Image gray(image.height, image.width);
   for (int y = 0; y < image.height; ++y) {
@@ -1156,32 +1106,104 @@ phasecorr::Image rotate_phasecorr_image(const phasecorr::Image &image, double ro
   return rotated;
 }
 
-Transform estimate_transform_phase_corr(const Image &reference, const Image &candidate) {
-  const phasecorr::Image ref_gray = to_phasecorr_image(reference);
-  const phasecorr::Image cand_gray = to_phasecorr_image(candidate);
-  static constexpr std::array<double, 11> coarse_angles = {
-      -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
+phasecorr::Image downsample_phasecorr_image_half(const phasecorr::Image &image) {
+  const int downsampled_rows = std::max(1, image.rows / 2);
+  const int downsampled_cols = std::max(1, image.cols / 2);
+  phasecorr::Image downsampled(downsampled_rows, downsampled_cols);
 
-  Transform best{};
-  double best_peak = -std::numeric_limits<double>::infinity();
-  double best_angle = 0.0;
-
-  for (double angle : coarse_angles) {
-    const phasecorr::Image rotated = rotate_phasecorr_image(cand_gray, angle);
-    const phasecorr::PhaseCorrelationResult result = phasecorr::phaseCorrelation(ref_gray, rotated);
-    if (result.peak > best_peak) {
-      best_peak = result.peak;
-      best_angle = angle;
-      best.dx = result.shift.x();
-      best.dy = result.shift.y();
-      best.rotation_degrees = angle;
+  for (int y = 0; y < downsampled_rows; ++y) {
+    const int source_y0 = std::min(y * 2, image.rows - 1);
+    const int source_y1 = std::min(source_y0 + 1, image.rows - 1);
+    for (int x = 0; x < downsampled_cols; ++x) {
+      const int source_x0 = std::min(x * 2, image.cols - 1);
+      const int source_x1 = std::min(source_x0 + 1, image.cols - 1);
+      const float top = 0.5f * (image(source_y0, source_x0) + image(source_y0, source_x1));
+      const float bottom = 0.5f * (image(source_y1, source_x0) + image(source_y1, source_x1));
+      downsampled(y, x) = 0.5f * (top + bottom);
     }
   }
 
-  for (int step = -5; step <= 5; ++step) {
-    const double angle = best_angle + 0.2 * static_cast<double>(step);
-    const phasecorr::Image rotated = rotate_phasecorr_image(cand_gray, angle);
-    const phasecorr::PhaseCorrelationResult result = phasecorr::phaseCorrelation(ref_gray, rotated);
+  return downsampled;
+}
+
+Fs::path alignment_gray_cache_path_for(const Fs::path &cache_dir, std::size_t index) {
+  std::ostringstream name;
+  name << "image_" << std::setw(6) << std::setfill('0') << index << ".bin";
+  return cache_dir / name.str();
+}
+
+void write_gray_image_cache(const Fs::path &path, const phasecorr::Image &image) {
+  std::ofstream stream(path, std::ios::binary);
+  if (!stream) {
+    fail("Unable to write alignment cache: " + path.string());
+  }
+
+  const std::int32_t rows = image.rows;
+  const std::int32_t cols = image.cols;
+  std::vector<std::uint8_t> buffer(static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
+  for (std::size_t i = 0; i < buffer.size(); ++i) {
+    buffer[i] = static_cast<std::uint8_t>(std::clamp(std::lround(image.data[i]), 0L, 255L));
+  }
+
+  stream.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+  stream.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+  stream.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+  if (!stream) {
+    fail("Unable to finish writing alignment cache: " + path.string());
+  }
+}
+
+phasecorr::Image read_gray_image_cache(const Fs::path &path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    fail("Unable to read alignment cache: " + path.string());
+  }
+
+  std::int32_t rows = 0;
+  std::int32_t cols = 0;
+  stream.read(reinterpret_cast<char *>(&rows), sizeof(rows));
+  stream.read(reinterpret_cast<char *>(&cols), sizeof(cols));
+  if (!stream || rows <= 0 || cols <= 0) {
+    fail("Invalid alignment cache header: " + path.string());
+  }
+
+  std::vector<std::uint8_t> buffer(static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
+  stream.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+  if (!stream) {
+    fail("Invalid alignment cache payload: " + path.string());
+  }
+
+  phasecorr::Image image(rows, cols);
+  for (std::size_t i = 0; i < buffer.size(); ++i) {
+    image.data[i] = static_cast<float>(buffer[i]);
+  }
+  return image;
+}
+
+void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::path &cache_dir) {
+  std::error_code ec;
+  Fs::create_directories(cache_dir, ec);
+  if (ec) {
+    fail("Unable to create alignment cache directory: " + cache_dir.string());
+  }
+
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const Image image = load_image(entries[i].path);
+    const phasecorr::Image gray = to_phasecorr_image(image);
+    write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
+    print_progress("preparing alignment cache", i + 1, entries.size());
+  }
+}
+
+Transform estimate_transform_for_angles(const phasecorr::Image &reference,
+                                        const phasecorr::Image &candidate,
+                                        std::span<const double> angles) {
+  Transform best{};
+  double best_peak = -std::numeric_limits<double>::infinity();
+
+  for (double angle : angles) {
+    const phasecorr::Image rotated = rotate_phasecorr_image(candidate, angle);
+    const phasecorr::PhaseCorrelationResult result = phasecorr::phaseCorrelation(reference, rotated);
     if (result.peak > best_peak) {
       best_peak = result.peak;
       best.dx = result.shift.x();
@@ -1193,63 +1215,101 @@ Transform estimate_transform_phase_corr(const Image &reference, const Image &can
   return best;
 }
 
-AlignmentData compute_alignment_from_loaded_images(const std::vector<ImageInfo> &inputs,
-                                                   std::size_t parallelism,
-                                                   std::string_view operation) {
+Transform estimate_transform_phase_corr(const phasecorr::Image &ref_gray,
+                                        const phasecorr::Image &cand_gray,
+                                        const phasecorr::Image &ref_gray_half,
+                                        const phasecorr::Image &cand_gray_half) {
+  static constexpr std::array<double, 11> coarse_angles = {
+      -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
+  static constexpr std::array<double, 9> refinement_offsets = {
+      -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4};
+
+  const Transform coarse = estimate_transform_for_angles(ref_gray_half, cand_gray_half, coarse_angles);
+
+  std::array<double, refinement_offsets.size()> refinement_angles{};
+  for (std::size_t i = 0; i < refinement_offsets.size(); ++i) {
+    refinement_angles[i] = coarse.rotation_degrees + refinement_offsets[i];
+  }
+
+  return estimate_transform_for_angles(ref_gray, cand_gray, refinement_angles);
+}
+
+AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entries,
+                                             const Fs::path &alignment_cache_dir,
+                                             std::size_t parallelism,
+                                             std::string_view operation) {
   AlignmentData alignment{};
-  alignment.relative_transforms.assign(inputs.size(), Transform{});
-  if (inputs.size() <= 1) {
-    alignment.total_transforms.assign(inputs.size(), Transform{});
+  alignment.relative_transforms.assign(entries.size(), Transform{});
+  if (entries.size() <= 1) {
+    alignment.total_transforms.assign(entries.size(), Transform{});
     return alignment;
   }
 
-  const std::size_t task_count = inputs.size() - 1;
+  const std::size_t task_count = entries.size() - 1;
   const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
   if (worker_count == 1) {
-    for (std::size_t index = 1; index < inputs.size(); ++index) {
-      const Transform delta = estimate_transform_phase_corr(inputs[index - 1].image, inputs[index].image);
+    phasecorr::Image previous_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, 0));
+    phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
+    for (std::size_t index = 1; index < entries.size(); ++index) {
+      phasecorr::Image current_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
+      phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
+      const Transform delta =
+          estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half);
       alignment.relative_transforms[index] = delta;
       print_alignment_progress(operation, index, task_count, delta);
+      previous_gray = std::move(current_gray);
+      previous_gray_half = std::move(current_gray_half);
     }
     alignment.total_transforms = accumulate_total_transforms(alignment.relative_transforms);
     return alignment;
   }
 
-  std::atomic<std::size_t> next_index{1};
+  const std::size_t chunk_size = (task_count + worker_count - 1) / worker_count;
   std::mutex error_mutex;
   std::exception_ptr first_error;
 
-  auto worker = [&]() {
-    while (true) {
-      const std::size_t index = next_index.fetch_add(1);
-      if (index >= inputs.size()) {
-        break;
-      }
+  auto worker = [&](std::size_t worker_index) {
+    const std::size_t start_index = 1 + worker_index * chunk_size;
+    if (start_index >= entries.size()) {
+      return;
+    }
+    const std::size_t end_index = std::min(task_count, start_index + chunk_size - 1);
 
-      {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        if (first_error) {
-          break;
+    try {
+      phasecorr::Image previous_gray =
+          read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, start_index - 1));
+      phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
+
+      for (std::size_t index = start_index; index <= end_index; ++index) {
+        {
+          std::lock_guard<std::mutex> lock(error_mutex);
+          if (first_error) {
+            return;
+          }
         }
-      }
 
-      try {
-        const Transform delta = estimate_transform_phase_corr(inputs[index - 1].image, inputs[index].image);
+        phasecorr::Image current_gray =
+            read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
+        phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
+        const Transform delta =
+            estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half);
         alignment.relative_transforms[index] = delta;
         print_alignment_progress(operation, index, task_count, delta);
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        if (!first_error) {
-          first_error = std::current_exception();
-        }
+        previous_gray = std::move(current_gray);
+        previous_gray_half = std::move(current_gray_half);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      if (!first_error) {
+        first_error = std::current_exception();
       }
     }
   };
 
   std::vector<std::thread> workers;
   workers.reserve(worker_count);
-  for (std::size_t i = 0; i < worker_count; ++i) {
-    workers.emplace_back(worker);
+  for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+    workers.emplace_back(worker, worker_index);
   }
   for (auto &worker_thread : workers) {
     worker_thread.join();
@@ -1355,28 +1415,33 @@ std::array<double, 3> sample_rgb(const Image &image, double x, double y) {
   return result;
 }
 
-Image apply_transform_with_padding(const Image &image, const Transform &transform) {
+Image render_transformed_region(const Image &image,
+                                const Transform &transform,
+                                int origin_x,
+                                int origin_y,
+                                int width,
+                                int height) {
   Image result{};
-  result.width = image.width;
-  result.height = image.height;
-  result.pixels.assign(static_cast<std::size_t>(image.width) *
-                           static_cast<std::size_t>(image.height) * 3U,
-                       0);
+  result.width = width;
+  result.height = height;
+  result.pixels.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U, 0);
   const double cx = 0.5 * static_cast<double>(image.width - 1);
   const double cy = 0.5 * static_cast<double>(image.height - 1);
   const double radians = degrees_to_radians(transform.rotation_degrees);
   const double cosine = std::cos(radians);
   const double sine = std::sin(radians);
 
-  for (int y = 0; y < image.height; ++y) {
-    for (int x = 0; x < image.width; ++x) {
-      const double dest_dx = static_cast<double>(x) - cx - transform.dx;
-      const double dest_dy = static_cast<double>(y) - cy - transform.dy;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const double padded_x = static_cast<double>(origin_x + x);
+      const double padded_y = static_cast<double>(origin_y + y);
+      const double dest_dx = padded_x - cx - transform.dx;
+      const double dest_dy = padded_y - cy - transform.dy;
       const double source_x = cosine * dest_dx + sine * dest_dy + cx;
       const double source_y = -sine * dest_dx + cosine * dest_dy + cy;
       const auto rgb = sample_rgb(image, source_x, source_y);
       const std::size_t destination_index =
-          (static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width) +
+          (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
            static_cast<std::size_t>(x)) * 3U;
       result.pixels[destination_index] = static_cast<std::uint8_t>(std::clamp(std::lround(rgb[0]), 0L, 255L));
       result.pixels[destination_index + 1] = static_cast<std::uint8_t>(std::clamp(std::lround(rgb[1]), 0L, 255L));
@@ -1387,183 +1452,122 @@ Image apply_transform_with_padding(const Image &image, const Transform &transfor
   return result;
 }
 
-Image crop_image(const Image &image, int x0, int y0, int width, int height) {
-  Image result{};
-  result.width = width;
-  result.height = height;
-  result.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U);
-
-  for (int y = 0; y < height; ++y) {
-    const std::size_t source_index =
-        (static_cast<std::size_t>(y0 + y) * static_cast<std::size_t>(image.width) +
-         static_cast<std::size_t>(x0)) * 3U;
-    const std::size_t destination_index =
-        static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 3U;
-    std::copy_n(image.pixels.data() + source_index, static_cast<std::size_t>(width) * 3U,
-                result.pixels.data() + destination_index);
-  }
-
-  return result;
+int slice_begin(int extent, std::size_t count, std::size_t index) {
+  return static_cast<int>((index * static_cast<std::size_t>(extent)) / count);
 }
 
-Image transform_image(const Image &image, const Transform &transform, bool global_crop, CropRect crop_rect) {
-  Image transformed = apply_transform_with_padding(image, transform);
-  if (!global_crop) {
-    return transformed;
-  }
-  return crop_image(transformed, crop_rect.x, crop_rect.y, crop_rect.width, crop_rect.height);
+int slice_end(int extent, std::size_t count, std::size_t index) {
+  return static_cast<int>(((index + 1) * static_cast<std::size_t>(extent)) / count);
 }
 
 Image extract_slice(const Image &image, std::size_t index, std::size_t count, SliceDirection direction) {
   if (direction == SliceDirection::kVertical) {
-    const int x0 = static_cast<int>((index * static_cast<std::size_t>(image.width)) / count);
-    const int x1 = static_cast<int>(((index + 1) * static_cast<std::size_t>(image.width)) / count);
-    const int slice_width = x1 - x0;
-    Image slice{};
-    slice.width = slice_width;
-    slice.height = image.height;
-    slice.pixels.resize(static_cast<std::size_t>(slice_width) * static_cast<std::size_t>(image.height) * 3U);
-
-    for (int y = 0; y < image.height; ++y) {
-      const std::size_t source_index =
-          (static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width) +
-           static_cast<std::size_t>(x0)) * 3U;
-      const std::size_t destination_index =
-          static_cast<std::size_t>(y) * static_cast<std::size_t>(slice_width) * 3U;
-      std::copy_n(image.pixels.data() + source_index, static_cast<std::size_t>(slice_width) * 3U,
-                  slice.pixels.data() + destination_index);
-    }
-    return slice;
+    const int x0 = slice_begin(image.width, count, index);
+    const int x1 = slice_end(image.width, count, index);
+    return render_transformed_region(image, Transform{}, x0, 0, x1 - x0, image.height);
   }
 
-  const int y0 = static_cast<int>((index * static_cast<std::size_t>(image.height)) / count);
-  const int y1 = static_cast<int>(((index + 1) * static_cast<std::size_t>(image.height)) / count);
-  const int slice_height = y1 - y0;
-  Image slice{};
-  slice.width = image.width;
-  slice.height = slice_height;
-  slice.pixels.resize(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(slice_height) * 3U);
-
-  for (int y = 0; y < slice_height; ++y) {
-    const std::size_t source_index =
-        (static_cast<std::size_t>(y0 + y) * static_cast<std::size_t>(image.width)) * 3U;
-    const std::size_t destination_index =
-        static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width) * 3U;
-    std::copy_n(image.pixels.data() + source_index, static_cast<std::size_t>(image.width) * 3U,
-                slice.pixels.data() + destination_index);
-  }
-  return slice;
+  const int y0 = slice_begin(image.height, count, index);
+  const int y1 = slice_end(image.height, count, index);
+  return render_transformed_region(image, Transform{}, 0, y0, image.width, y1 - y0);
 }
 
-Image compose_slices(const std::vector<Image> &images, SliceDirection direction) {
-  const std::size_t count = images.size();
-  const int width = images.front().width;
-  const int height = images.front().height;
-
-  Image result{};
-  result.width = width;
-  result.height = height;
-  result.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U);
+Image render_transformed_slice(const Image &image,
+                               std::size_t index,
+                               std::size_t count,
+                               SliceDirection direction,
+                               const Transform &transform,
+                               bool pad_result,
+                               CropRect crop_rect) {
+  const int output_width = pad_result ? image.width : crop_rect.width;
+  const int output_height = pad_result ? image.height : crop_rect.height;
+  const int origin_x = pad_result ? 0 : crop_rect.x;
+  const int origin_y = pad_result ? 0 : crop_rect.y;
 
   if (direction == SliceDirection::kVertical) {
-    for (std::size_t index = 0; index < count; ++index) {
-      const int x0 = static_cast<int>((index * static_cast<std::size_t>(width)) / count);
-      const int x1 = static_cast<int>(((index + 1) * static_cast<std::size_t>(width)) / count);
-      const int slice_width = x1 - x0;
-      if (slice_width <= 0) {
-        continue;
-      }
-
-      for (int y = 0; y < height; ++y) {
-        const std::size_t source_index =
-            (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-             static_cast<std::size_t>(x0)) * 3U;
-        const std::size_t destination_index = source_index;
-        std::copy_n(images[index].pixels.data() + source_index,
-                    static_cast<std::size_t>(slice_width) * 3U,
-                    result.pixels.data() + destination_index);
-      }
-    }
-  } else {
-    for (std::size_t index = 0; index < count; ++index) {
-      const int y0 = static_cast<int>((index * static_cast<std::size_t>(height)) / count);
-      const int y1 = static_cast<int>(((index + 1) * static_cast<std::size_t>(height)) / count);
-      const int slice_height = y1 - y0;
-      if (slice_height <= 0) {
-        continue;
-      }
-
-      const std::size_t bytes = static_cast<std::size_t>(slice_height) *
-                                static_cast<std::size_t>(width) * 3U;
-      const std::size_t offset = static_cast<std::size_t>(y0) *
-                                 static_cast<std::size_t>(width) * 3U;
-      std::copy_n(images[index].pixels.data() + offset, bytes,
-                  result.pixels.data() + offset);
-    }
+    const int x0 = slice_begin(output_width, count, index);
+    const int x1 = slice_end(output_width, count, index);
+    return render_transformed_region(image, transform, origin_x + x0, origin_y, x1 - x0, output_height);
   }
 
-  return result;
-}
-
-std::string escape_json(std::string_view input) {
-  std::string result;
-  for (const unsigned char ch : input) {
-    switch (ch) {
-      case '\\':
-        result += "\\\\";
-        break;
-      case '"':
-        result += "\\\"";
-        break;
-      case '\b':
-        result += "\\b";
-        break;
-      case '\f':
-        result += "\\f";
-        break;
-      case '\n':
-        result += "\\n";
-        break;
-      case '\r':
-        result += "\\r";
-        break;
-      case '\t':
-        result += "\\t";
-        break;
-      default:
-        result += static_cast<char>(ch);
-        break;
-    }
-  }
-  return result;
+  const int y0 = slice_begin(output_height, count, index);
+  const int y1 = slice_end(output_height, count, index);
+  return render_transformed_region(image, transform, origin_x, origin_y + y0, output_width, y1 - y0);
 }
 
 void write_alignment_json(const Fs::path &path,
                           const std::vector<InputEntry> &entries,
                           const AlignmentData &alignment) {
+  std::error_code ec;
+  if (path.has_parent_path()) {
+    Fs::create_directories(path.parent_path(), ec);
+    if (ec) {
+      fail("Unable to create alignment JSON directory: " + path.parent_path().string());
+    }
+  }
+
   std::ofstream stream(path);
   if (!stream) {
     fail("Unable to write alignment JSON: " + path.string());
   }
 
-  stream << "{\n";
+  nlohmann::json document;
+  document["version"] = 1;
+  document["entries"] = nlohmann::json::array();
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    stream << "  \"" << escape_json(entries[i].filename) << "\": {"
-           << "\"relative\": {\"x\": " << alignment.relative_transforms[i].dx
-           << ", \"y\": " << alignment.relative_transforms[i].dy
-           << ", \"rotation_degrees\": " << alignment.relative_transforms[i].rotation_degrees
-           << "}, "
-           << "\"total\": {\"x\": " << alignment.total_transforms[i].dx
-           << ", \"y\": " << alignment.total_transforms[i].dy
-           << ", \"rotation_degrees\": " << alignment.total_transforms[i].rotation_degrees
-           << "}"
-           << "}";
-    if (i + 1 != entries.size()) {
-      stream << ",";
-    }
-    stream << "\n";
+    document["entries"].push_back({
+        {"filename", entries[i].filename},
+        {"relative",
+         {{"x", alignment.relative_transforms[i].dx},
+          {"y", alignment.relative_transforms[i].dy},
+          {"rotation_degrees", alignment.relative_transforms[i].rotation_degrees}}},
+        {"total",
+         {{"x", alignment.total_transforms[i].dx},
+          {"y", alignment.total_transforms[i].dy},
+          {"rotation_degrees", alignment.total_transforms[i].rotation_degrees}}},
+    });
   }
-  stream << "}\n";
+  stream << std::setw(2) << document << '\n';
+}
+
+Transform transform_from_json(const nlohmann::json &value) {
+  Transform transform{};
+  transform.dx = value.at("x").get<double>();
+  transform.dy = value.at("y").get<double>();
+  transform.rotation_degrees = value.at("rotation_degrees").get<double>();
+  return transform;
+}
+
+AlignmentData read_alignment_json(const Fs::path &path, const std::vector<InputEntry> &entries) {
+  std::ifstream stream(path);
+  if (!stream) {
+    fail("Unable to open alignment JSON: " + path.string());
+  }
+
+  nlohmann::json document;
+  stream >> document;
+
+  if (!document.contains("entries") || !document["entries"].is_array()) {
+    fail("Alignment JSON has no entries array: " + path.string());
+  }
+
+  const auto &items = document["entries"];
+  if (items.size() != entries.size()) {
+    fail("Alignment JSON entry count does not match current input selection.");
+  }
+
+  AlignmentData alignment{};
+  alignment.relative_transforms.resize(entries.size());
+  alignment.total_transforms.resize(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto &item = items[i];
+    if (item.at("filename").get<std::string>() != entries[i].filename) {
+      fail("Alignment JSON order does not match current input selection.");
+    }
+    alignment.relative_transforms[i] = transform_from_json(item.at("relative"));
+    alignment.total_transforms[i] = transform_from_json(item.at("total"));
+  }
+  return alignment;
 }
 
 Fs::path output_directory(const Fs::path &output_path) {
@@ -1587,6 +1591,14 @@ Fs::path prepare_temp_directory(const Fs::path &output_path) {
   return temp_dir;
 }
 
+Fs::path alignment_path_for(const Options &options, const Fs::path &temp_dir) {
+  (void)temp_dir;
+  if (!options.alignment_json_path.empty()) {
+    return options.alignment_json_path;
+  }
+  return output_directory(options.output_path) / "alignment.json";
+}
+
 Fs::path slice_path_for(const Fs::path &temp_dir, std::size_t index) {
   std::ostringstream name;
   name << "slice_" << std::setw(6) << std::setfill('0') << index << ".tiff";
@@ -1598,135 +1610,302 @@ void dump_slices_no_alignment(const std::vector<InputEntry> &entries,
                               const Fs::path &temp_dir,
                               std::size_t parallelism) {
   (void)parallelism;
-  parallel_for(entries.size(), 1, "dumping slices", [&](std::size_t i) {
+  for (std::size_t i = 0; i < entries.size(); ++i) {
     const Image image = load_image(entries[i].path);
     const Image slice = extract_slice(image, i, entries.size(), direction);
     write_tiff(slice_path_for(temp_dir, i), slice);
-  });
+    print_progress("dumping slices", i + 1, entries.size());
+  }
 }
 
 void dump_transformed_slices(const std::vector<InputEntry> &entries,
                              const std::vector<Transform> &transforms,
                              SliceDirection direction,
-                             bool global_crop,
+                             bool pad_result,
                              CropRect crop_rect,
                              const Fs::path &temp_dir,
                              std::size_t parallelism) {
   (void)parallelism;
-  parallel_for(entries.size(), 1, "dumping slices", [&](std::size_t i) {
-    const Image image = load_image(entries[i].path);
-    const Image transformed = transform_image(image, transforms[i], global_crop, crop_rect);
-    const Image slice = extract_slice(transformed, i, entries.size(), direction);
-    write_tiff(slice_path_for(temp_dir, i), slice);
-  });
-}
-
-Image merge_slices_from_temp(const std::vector<InputEntry> &entries,
-                             SliceDirection direction,
-                             const Fs::path &temp_dir,
-                             int output_width,
-                             int output_height) {
-  Image result{};
-  result.width = output_width;
-  result.height = output_height;
-  result.pixels.assign(static_cast<std::size_t>(output_width) *
-                           static_cast<std::size_t>(output_height) * 3U,
-                       0);
-
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    print_progress("merging slices", i + 1, entries.size());
-    const Image slice = load_tiff_image(slice_path_for(temp_dir, i));
-    if (direction == SliceDirection::kVertical) {
-      const int x0 = static_cast<int>((i * static_cast<std::size_t>(output_width)) / entries.size());
-      for (int y = 0; y < output_height; ++y) {
-        const std::size_t source_index =
-            static_cast<std::size_t>(y) * static_cast<std::size_t>(slice.width) * 3U;
-        const std::size_t destination_index =
-            (static_cast<std::size_t>(y) * static_cast<std::size_t>(output_width) +
-             static_cast<std::size_t>(x0)) * 3U;
-        std::copy_n(slice.pixels.data() + source_index, static_cast<std::size_t>(slice.width) * 3U,
-                    result.pixels.data() + destination_index);
+    const Image image = load_image(entries[i].path);
+    const Image slice =
+        render_transformed_slice(image, i, entries.size(), direction, transforms[i], pad_result, crop_rect);
+    write_tiff(slice_path_for(temp_dir, i), slice);
+    print_progress("dumping slices", i + 1, entries.size());
+  }
+}
+
+class ScanlineWriter {
+public:
+  virtual ~ScanlineWriter() = default;
+  virtual void write_row(std::span<const std::uint8_t> row) = 0;
+};
+
+class JpegScanlineWriter final : public ScanlineWriter {
+public:
+  JpegScanlineWriter(const Fs::path &path, int width, int height, int quality) {
+    file_ = std::fopen(path.string().c_str(), "wb");
+    if (file_ == nullptr) {
+      fail("Unable to open output file: " + path.string());
+    }
+
+    cinfo_.err = jpeg_std_error(&jerr_.base);
+    jerr_.base.error_exit = jpeg_error_exit;
+    if (setjmp(jerr_.jump_buffer) != 0) {
+      jpeg_destroy_compress(&cinfo_);
+      std::fclose(file_);
+      fail("Failed to write JPEG file: " + path.string());
+    }
+
+    jpeg_create_compress(&cinfo_);
+    jpeg_stdio_dest(&cinfo_, file_);
+    cinfo_.image_width = static_cast<JDIMENSION>(width);
+    cinfo_.image_height = static_cast<JDIMENSION>(height);
+    cinfo_.input_components = 3;
+    cinfo_.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo_);
+    jpeg_set_quality(&cinfo_, quality, TRUE);
+    jpeg_start_compress(&cinfo_, TRUE);
+  }
+
+  ~JpegScanlineWriter() override {
+    if (file_ != nullptr) {
+      jpeg_finish_compress(&cinfo_);
+      jpeg_destroy_compress(&cinfo_);
+      std::fclose(file_);
+    }
+  }
+
+  void write_row(std::span<const std::uint8_t> row) override {
+    auto *scanline = const_cast<JSAMPLE *>(row.data());
+    JSAMPROW rows[] = {scanline};
+    jpeg_write_scanlines(&cinfo_, rows, 1);
+  }
+
+private:
+  FILE *file_ = nullptr;
+  jpeg_compress_struct cinfo_{};
+  JpegErrorManager jerr_{};
+};
+
+class TiffScanlineWriter final : public ScanlineWriter {
+public:
+  TiffScanlineWriter(const Fs::path &path, int width, int height) {
+    tiff_ = TIFFOpen(path.string().c_str(), "w");
+    if (tiff_ == nullptr) {
+      fail("Unable to open output TIFF file: " + path.string());
+    }
+
+    if (TIFFSetField(tiff_, TIFFTAG_IMAGEWIDTH, static_cast<std::uint32_t>(width)) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_IMAGELENGTH, static_cast<std::uint32_t>(height)) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_SAMPLESPERPIXEL, 3) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_BITSPERSAMPLE, 8) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_COMPRESSION, COMPRESSION_LZW) != 1 ||
+        TIFFSetField(tiff_, TIFFTAG_ROWSPERSTRIP,
+                     TIFFDefaultStripSize(tiff_, static_cast<std::uint32_t>(width) * 3U)) != 1) {
+      TIFFClose(tiff_);
+      fail("Failed to configure TIFF output: " + path.string());
+    }
+  }
+
+  ~TiffScanlineWriter() override {
+    if (tiff_ != nullptr) {
+      TIFFClose(tiff_);
+    }
+  }
+
+  void write_row(std::span<const std::uint8_t> row) override {
+    if (TIFFWriteScanline(tiff_, const_cast<std::uint8_t *>(row.data()), next_row_, 0) < 0) {
+      fail("Failed to write TIFF scanline.");
+    }
+    ++next_row_;
+  }
+
+private:
+  TIFF *tiff_ = nullptr;
+  std::uint32_t next_row_ = 0;
+};
+
+std::unique_ptr<ScanlineWriter> open_output_writer(const Fs::path &path,
+                                                   int width,
+                                                   int height,
+                                                   int jpeg_quality) {
+  const std::string extension = lowercase(path.extension().string());
+  if (extension == ".jpg" || extension == ".jpeg") {
+    return std::make_unique<JpegScanlineWriter>(path, width, height, jpeg_quality);
+  }
+  if (extension == ".tif" || extension == ".tiff") {
+    return std::make_unique<TiffScanlineWriter>(path, width, height);
+  }
+  fail("Unsupported output format. Use .jpg, .jpeg, .tif, or .tiff.");
+}
+
+class TiffSliceReader {
+public:
+  explicit TiffSliceReader(const Fs::path &path) {
+    tiff_ = TIFFOpen(path.string().c_str(), "r");
+    if (tiff_ == nullptr) {
+      fail("Unable to open TIFF file: " + path.string());
+    }
+
+    std::uint32_t raw_width = 0;
+    std::uint32_t raw_height = 0;
+    std::uint16_t samples_per_pixel = 0;
+    std::uint16_t bits_per_sample = 0;
+    std::uint16_t planar_config = 0;
+    std::uint16_t photometric = 0;
+    if (TIFFGetField(tiff_, TIFFTAG_IMAGEWIDTH, &raw_width) != 1 ||
+        TIFFGetField(tiff_, TIFFTAG_IMAGELENGTH, &raw_height) != 1 ||
+        TIFFGetField(tiff_, TIFFTAG_SAMPLESPERPIXEL, &samples_per_pixel) != 1 ||
+        TIFFGetField(tiff_, TIFFTAG_BITSPERSAMPLE, &bits_per_sample) != 1 ||
+        TIFFGetField(tiff_, TIFFTAG_PLANARCONFIG, &planar_config) != 1 ||
+        TIFFGetField(tiff_, TIFFTAG_PHOTOMETRIC, &photometric) != 1) {
+      TIFFClose(tiff_);
+      fail("Unable to read TIFF metadata: " + path.string());
+    }
+
+    if (samples_per_pixel != 3 || bits_per_sample != 8 ||
+        planar_config != PLANARCONFIG_CONTIG || photometric != PHOTOMETRIC_RGB) {
+      TIFFClose(tiff_);
+      fail("Unsupported TIFF layout: " + path.string());
+    }
+
+    width_ = static_cast<int>(raw_width);
+    height_ = static_cast<int>(raw_height);
+  }
+
+  ~TiffSliceReader() {
+    if (tiff_ != nullptr) {
+      TIFFClose(tiff_);
+    }
+  }
+
+  int width() const {
+    return width_;
+  }
+
+  int height() const {
+    return height_;
+  }
+
+  void read_next_row(std::span<std::uint8_t> row) {
+    if (TIFFReadScanline(tiff_, row.data(), next_row_, 0) < 0) {
+      fail("Unable to read TIFF scanline from slice.");
+    }
+    ++next_row_;
+  }
+
+private:
+  TIFF *tiff_ = nullptr;
+  int width_ = 0;
+  int height_ = 0;
+  std::uint32_t next_row_ = 0;
+};
+
+void merge_slices_to_output(const std::vector<InputEntry> &entries,
+                            SliceDirection direction,
+                            const Fs::path &temp_dir,
+                            const Fs::path &output_path,
+                            int output_width,
+                            int output_height,
+                            int jpeg_quality) {
+  auto writer = open_output_writer(output_path, output_width, output_height, jpeg_quality);
+  std::vector<std::uint8_t> output_row(static_cast<std::size_t>(output_width) * 3U);
+  std::size_t last_percent_bucket = std::numeric_limits<std::size_t>::max();
+  print_progress_percent_5("merging slices", 0, static_cast<std::size_t>(output_height), last_percent_bucket);
+
+  if (direction == SliceDirection::kVertical) {
+    std::vector<std::unique_ptr<TiffSliceReader>> readers;
+    readers.reserve(entries.size());
+    std::vector<std::vector<std::uint8_t>> slice_rows;
+    slice_rows.reserve(entries.size());
+
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      readers.push_back(std::make_unique<TiffSliceReader>(slice_path_for(temp_dir, i)));
+      if (readers.back()->height() != output_height) {
+        fail("Slice height does not match output height.");
       }
-    } else {
-      const int y0 = static_cast<int>((i * static_cast<std::size_t>(output_height)) / entries.size());
-      const std::size_t bytes = static_cast<std::size_t>(slice.height) *
-                                static_cast<std::size_t>(slice.width) * 3U;
-      const std::size_t destination_index =
-          static_cast<std::size_t>(y0) * static_cast<std::size_t>(output_width) * 3U;
-      std::copy_n(slice.pixels.data(), bytes, result.pixels.data() + destination_index);
+      slice_rows.emplace_back(static_cast<std::size_t>(readers.back()->width()) * 3U);
     }
+
+    for (int row = 0; row < output_height; ++row) {
+      std::size_t offset = 0;
+      for (std::size_t i = 0; i < readers.size(); ++i) {
+        readers[i]->read_next_row(slice_rows[i]);
+        std::copy(slice_rows[i].begin(), slice_rows[i].end(),
+                  output_row.begin() + static_cast<std::ptrdiff_t>(offset));
+        offset += slice_rows[i].size();
+      }
+      writer->write_row(output_row);
+      print_progress_percent_5("merging slices", static_cast<std::size_t>(row + 1),
+                               static_cast<std::size_t>(output_height), last_percent_bucket);
+    }
+    return;
   }
 
-  return result;
+  std::size_t written_rows = 0;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    TiffSliceReader reader(slice_path_for(temp_dir, i));
+    if (reader.width() != output_width) {
+      fail("Slice width does not match output width.");
+    }
+
+    for (int row = 0; row < reader.height(); ++row) {
+      reader.read_next_row(output_row);
+      writer->write_row(output_row);
+      ++written_rows;
+      print_progress_percent_5("merging slices", written_rows, static_cast<std::size_t>(output_height),
+                               last_percent_bucket);
+    }
+  }
 }
 
-Image run_in_memory_pipeline(const Options &options, const std::vector<InputEntry> &entries) {
-  std::vector<ImageInfo> inputs = load_selected_images(entries, options.parallelism);
-
-  if (options.global_auto_align) {
-    const AlignmentData alignment =
-        compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment");
-    const CropRect crop = compute_crop_rect(inputs.front().image.width, inputs.front().image.height,
-                                            alignment.total_transforms);
-    std::vector<Image> images;
-    images.reserve(inputs.size());
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-      print_progress("applying global alignment", i + 1, inputs.size());
-      images.push_back(transform_image(inputs[i].image, alignment.total_transforms[i], true, crop));
-    }
-    return compose_slices(images, options.direction);
+AlignmentData load_or_compute_alignment(const Fs::path &alignment_path,
+                                        const Fs::path &alignment_cache_dir,
+                                        const std::vector<InputEntry> &entries,
+                                        std::size_t parallelism) {
+  if (Fs::exists(alignment_path)) {
+    print_progress("loading alignment checkpoint", 1, 1);
+    return read_alignment_json(alignment_path, entries);
   }
 
-  if (options.auto_align) {
-    const AlignmentData alignment =
-        compute_alignment_from_loaded_images(inputs, options.parallelism, "auto alignment");
-    std::vector<Image> images;
-    images.reserve(inputs.size());
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-      print_progress("applying auto alignment", i + 1, inputs.size());
-      images.push_back(transform_image(inputs[i].image, alignment.total_transforms[i], false, CropRect{}));
-    }
-    return compose_slices(images, options.direction);
-  }
-
-  std::vector<Image> images;
-  images.reserve(inputs.size());
-  for (std::size_t i = 0; i < inputs.size(); ++i) {
-    print_progress("preparing images", i + 1, inputs.size());
-    images.push_back(std::move(inputs[i].image));
-  }
-  return compose_slices(images, options.direction);
+  prepare_alignment_cache(entries, alignment_cache_dir);
+  const AlignmentData alignment =
+      compute_alignment_from_entries(entries, alignment_cache_dir, parallelism, "auto alignment");
+  write_alignment_json(alignment_path, entries, alignment);
+  return alignment;
 }
 
-Image run_dump_pipeline(const Options &options, const std::vector<InputEntry> &entries) {
+void run_pipeline(const Options &options, const std::vector<InputEntry> &entries) {
   const Fs::path temp_dir = prepare_temp_directory(options.output_path);
-  const Fs::path alignment_path = temp_dir / "alignment.json";
+  const Fs::path alignment_path = alignment_path_for(options, temp_dir);
+  const Fs::path alignment_cache_dir = temp_dir / "alignment_cache";
   const int base_width = entries.front().width;
   const int base_height = entries.front().height;
 
-  if (!options.auto_align && !options.global_auto_align) {
+  int output_width = base_width;
+  int output_height = base_height;
+  CropRect crop_rect{};
+
+  if (!options.auto_align) {
     dump_slices_no_alignment(entries, options.direction, temp_dir, options.parallelism);
-    return merge_slices_from_temp(entries, options.direction, temp_dir, base_width, base_height);
-  }
-
-  if (options.auto_align) {
-    std::vector<ImageInfo> inputs = load_selected_images(entries, options.parallelism);
+  } else {
     const AlignmentData alignment =
-        compute_alignment_from_loaded_images(inputs, options.parallelism, "auto alignment");
-    write_alignment_json(alignment_path, entries, alignment);
-    dump_transformed_slices(entries, alignment.total_transforms, options.direction, false, CropRect{},
-                            temp_dir, options.parallelism);
-    return merge_slices_from_temp(entries, options.direction, temp_dir, base_width, base_height);
+        load_or_compute_alignment(alignment_path, alignment_cache_dir, entries, options.parallelism);
+    if (!options.pad_result) {
+      crop_rect = compute_crop_rect(base_width, base_height, alignment.total_transforms);
+      output_width = crop_rect.width;
+      output_height = crop_rect.height;
+    }
+    dump_transformed_slices(entries, alignment.total_transforms, options.direction, options.pad_result,
+                            crop_rect, temp_dir, options.parallelism);
   }
 
-  std::vector<ImageInfo> inputs = load_selected_images(entries, options.parallelism);
-  const AlignmentData alignment =
-      compute_alignment_from_loaded_images(inputs, options.parallelism, "global alignment");
-  const CropRect crop = compute_crop_rect(base_width, base_height, alignment.total_transforms);
-  write_alignment_json(alignment_path, entries, alignment);
-  dump_transformed_slices(entries, alignment.total_transforms, options.direction, true, crop, temp_dir,
-                          options.parallelism);
-  return merge_slices_from_temp(entries, options.direction, temp_dir, crop.width, crop.height);
+  merge_slices_to_output(entries, options.direction, temp_dir, options.output_path, output_width,
+                         output_height, options.jpeg_quality);
 }
 
 }  // namespace
@@ -1735,11 +1914,7 @@ int main(int argc, char **argv) {
   try {
     const Options options = parse_args(argc, argv);
     const std::vector<InputEntry> entries = gather_inputs(options);
-    const Image output = options.dump_intermediate
-                             ? run_dump_pipeline(options, entries)
-                             : run_in_memory_pipeline(options, entries);
-    print_progress("writing output", 1, 1);
-    write_output(options.output_path, output, options.jpeg_quality);
+    run_pipeline(options, entries);
     return 0;
   } catch (const std::exception &exception) {
     std::cerr << "Error: " << exception.what() << '\n';

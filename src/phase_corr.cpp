@@ -14,12 +14,6 @@ std::mutex &planner_mutex() {
   return *mutex;
 }
 
-std::mutex &execution_mutex() {
-  // Release-mode crashes suggest FFTW use is not safe in our current threaded setup.
-  static auto *mutex = new std::mutex();
-  return *mutex;
-}
-
 }  // namespace
 
 PhaseCorrelationResult phaseCorrelation(const Image &a, const Image &b) {
@@ -78,27 +72,24 @@ PhaseCorrelationResult phaseCorrelation(const Image &a, const Image &b) {
     throw std::runtime_error("Failed to create FFTW plans.");
   }
 
-  {
-    std::lock_guard<std::mutex> lock(execution_mutex());
-    fftwf_execute(plan_a);
-    fftwf_execute(plan_b);
+  fftwf_execute(plan_a);
+  fftwf_execute(plan_b);
 
-    for (int i = 0; i < complex_size; ++i) {
-      const float ar = freq_a[i][0];
-      const float ai = freq_a[i][1];
-      const float br = freq_b[i][0];
-      const float bi = -freq_b[i][1];
+  for (int i = 0; i < complex_size; ++i) {
+    const float ar = freq_a[i][0];
+    const float ai = freq_a[i][1];
+    const float br = freq_b[i][0];
+    const float bi = -freq_b[i][1];
 
-      const float rr = ar * br - ai * bi;
-      const float ri = ar * bi + ai * br;
-      const float magnitude = std::sqrt(rr * rr + ri * ri) + 1e-12f;
+    const float rr = ar * br - ai * bi;
+    const float ri = ar * bi + ai * br;
+    const float magnitude = std::sqrt(rr * rr + ri * ri) + 1e-12f;
 
-      freq_a[i][0] = rr / magnitude;
-      freq_a[i][1] = ri / magnitude;
-    }
-
-    fftwf_execute(plan_inverse);
+    freq_a[i][0] = rr / magnitude;
+    freq_a[i][1] = ri / magnitude;
   }
+
+  fftwf_execute(plan_inverse);
 
   int peak = 0;
   for (int i = 1; i < height * width; ++i) {

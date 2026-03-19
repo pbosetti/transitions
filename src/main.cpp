@@ -16,8 +16,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -33,6 +35,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace Fs = std::filesystem;
 
@@ -696,6 +702,51 @@ Image load_jpeg_image(const Fs::path &path) {
   return image;
 }
 
+Image load_jpeg_image_for_alignment(const Fs::path &path) {
+  std::lock_guard<std::mutex> lock(jpeg_mutex());
+  FILE *file = std::fopen(path.string().c_str(), "rb");
+  if (file == nullptr) {
+    fail("Unable to open JPEG file: " + path.string());
+  }
+
+  jpeg_decompress_struct cinfo{};
+  JpegErrorManager jerr{};
+  cinfo.err = jpeg_std_error(&jerr.base);
+  jerr.base.error_exit = jpeg_error_exit;
+
+  if (setjmp(jerr.jump_buffer) != 0) {
+    jpeg_destroy_decompress(&cinfo);
+    std::fclose(file);
+    fail("Failed to decode JPEG file: " + path.string());
+  }
+
+  jpeg_create_decompress(&cinfo);
+  jpeg_stdio_src(&cinfo, file);
+  jpeg_read_header(&cinfo, TRUE);
+  cinfo.scale_num = 1;
+  cinfo.scale_denom = 2;
+  cinfo.out_color_space = JCS_RGB;
+  jpeg_start_decompress(&cinfo);
+
+  Image image{};
+  image.width = static_cast<int>(cinfo.output_width);
+  image.height = static_cast<int>(cinfo.output_height);
+  image.pixels.resize(static_cast<std::size_t>(image.width) *
+                      static_cast<std::size_t>(image.height) * 3U);
+
+  const std::size_t row_stride = static_cast<std::size_t>(image.width) * 3U;
+  while (cinfo.output_scanline < cinfo.output_height) {
+    auto *row = image.pixels.data() + row_stride * cinfo.output_scanline;
+    JSAMPROW rows[] = {row};
+    jpeg_read_scanlines(&cinfo, rows, 1);
+  }
+
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  std::fclose(file);
+  return image;
+}
+
 Image load_dng_image(const Fs::path &path) {
   std::lock_guard<std::mutex> lock(libraw_mutex());
   LibRaw raw_processor;
@@ -710,6 +761,51 @@ Image load_dng_image(const Fs::path &path) {
   raw_processor.imgdata.params.no_auto_bright = 1;
   raw_processor.imgdata.params.use_auto_wb = 0;
   raw_processor.imgdata.params.output_color = 1;
+
+  result = raw_processor.unpack();
+  if (result != LIBRAW_SUCCESS) {
+    fail("Unable to unpack DNG file: " + path.string());
+  }
+
+  result = raw_processor.dcraw_process();
+  if (result != LIBRAW_SUCCESS) {
+    fail("Unable to process DNG file: " + path.string());
+  }
+
+  int error_code = LIBRAW_SUCCESS;
+  libraw_processed_image_t *processed = raw_processor.dcraw_make_mem_image(&error_code);
+  if (processed == nullptr || error_code != LIBRAW_SUCCESS) {
+    fail("Unable to convert DNG file: " + path.string());
+  }
+
+  if (processed->type != LIBRAW_IMAGE_BITMAP || processed->colors != 3 || processed->bits != 8) {
+    LibRaw::dcraw_clear_mem(processed);
+    fail("Unsupported DNG conversion result for file: " + path.string());
+  }
+
+  Image image{};
+  image.width = processed->width;
+  image.height = processed->height;
+  image.pixels.assign(processed->data, processed->data + processed->data_size);
+  LibRaw::dcraw_clear_mem(processed);
+  return image;
+}
+
+Image load_dng_image_for_alignment(const Fs::path &path) {
+  std::lock_guard<std::mutex> lock(libraw_mutex());
+  LibRaw raw_processor;
+
+  int result = raw_processor.open_file(path.string().c_str());
+  if (result != LIBRAW_SUCCESS) {
+    fail("Unable to open DNG file: " + path.string());
+  }
+
+  raw_processor.imgdata.params.use_camera_wb = 1;
+  raw_processor.imgdata.params.output_bps = 8;
+  raw_processor.imgdata.params.no_auto_bright = 1;
+  raw_processor.imgdata.params.use_auto_wb = 0;
+  raw_processor.imgdata.params.output_color = 1;
+  raw_processor.imgdata.params.half_size = 1;
 
   result = raw_processor.unpack();
   if (result != LIBRAW_SUCCESS) {
@@ -802,37 +898,15 @@ Image load_image(const Fs::path &path) {
   fail("Unsupported file type: " + path.string());
 }
 
-void write_tiff(const Fs::path &path, const Image &image) {
-  std::lock_guard<std::mutex> lock(tiff_mutex());
-  TIFF *tiff = TIFFOpen(path.string().c_str(), "w");
-  if (tiff == nullptr) {
-    fail("Unable to open output TIFF file: " + path.string());
+Image load_image_for_alignment(const Fs::path &path) {
+  const std::string extension = lowercase(path.extension().string());
+  if (extension == ".jpg" || extension == ".jpeg") {
+    return load_jpeg_image_for_alignment(path);
   }
-
-  if (TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, static_cast<std::uint32_t>(image.width)) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, static_cast<std::uint32_t>(image.height)) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, 3) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, 8) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_LZW) != 1 ||
-      TIFFSetField(tiff, TIFFTAG_ROWSPERSTRIP,
-                   TIFFDefaultStripSize(tiff, static_cast<std::uint32_t>(image.width) * 3U)) != 1) {
-    TIFFClose(tiff);
-    fail("Failed to configure TIFF output: " + path.string());
+  if (extension == ".dng") {
+    return load_dng_image_for_alignment(path);
   }
-
-  for (int row = 0; row < image.height; ++row) {
-    auto *scanline = const_cast<std::uint8_t *>(
-        image.pixels.data() + static_cast<std::size_t>(row) * static_cast<std::size_t>(image.width) * 3U);
-    if (TIFFWriteScanline(tiff, scanline, static_cast<std::uint32_t>(row), 0) < 0) {
-      TIFFClose(tiff);
-      fail("Failed to write TIFF scanline: " + path.string());
-    }
-  }
-
-  TIFFClose(tiff);
+  return load_image(path);
 }
 
 std::vector<Fs::path> list_input_files(const Fs::path &input_dir) {
@@ -936,6 +1010,139 @@ void parallel_for(std::size_t task_count,
   }
 }
 
+template <typename Worker>
+void parallel_for_no_progress(std::size_t task_count, std::size_t parallelism, Worker worker_fn) {
+  if (task_count == 0) {
+    return;
+  }
+
+  const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
+  if (worker_count == 1) {
+    for (std::size_t index = 0; index < task_count; ++index) {
+      worker_fn(index);
+    }
+    return;
+  }
+
+  std::atomic<std::size_t> next_index{0};
+  std::mutex error_mutex;
+  std::exception_ptr first_error;
+
+  auto worker = [&]() {
+    while (true) {
+      const std::size_t index = next_index.fetch_add(1);
+      if (index >= task_count) {
+        break;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (first_error) {
+          break;
+        }
+      }
+
+      try {
+        worker_fn(index);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (!first_error) {
+          first_error = std::current_exception();
+        }
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  for (std::size_t i = 0; i < worker_count; ++i) {
+    workers.emplace_back(worker);
+  }
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+
+  if (first_error) {
+    std::rethrow_exception(first_error);
+  }
+}
+
+template <typename Decoder, typename Processor>
+void run_overlapped_image_pipeline(std::size_t task_count,
+                                   std::string_view progress_name,
+                                   Decoder decode_fn,
+                                   Processor process_fn) {
+  if (task_count == 0) {
+    return;
+  }
+
+  std::future<void> pending_task;
+  bool has_pending_task = false;
+  std::size_t pending_index = 0;
+
+  auto finish_pending = [&]() {
+    if (!has_pending_task) {
+      return;
+    }
+    pending_task.get();
+    print_progress(progress_name, pending_index + 1, task_count);
+    has_pending_task = false;
+  };
+
+  for (std::size_t index = 0; index < task_count; ++index) {
+    Image image = decode_fn(index);
+    finish_pending();
+    pending_index = index;
+    pending_task = std::async(std::launch::async,
+                              [&, index, image = std::move(image)]() mutable {
+                                process_fn(index, std::move(image));
+                              });
+    has_pending_task = true;
+  }
+
+  finish_pending();
+}
+
+template <typename Decoder, typename Renderer>
+std::vector<Image> render_slices_in_memory(std::size_t task_count,
+                                           std::size_t parallelism,
+                                           std::string_view progress_name,
+                                           Decoder decode_fn,
+                                           Renderer render_fn) {
+  std::vector<Image> slices(task_count);
+  if (task_count == 0) {
+    return slices;
+  }
+
+  const std::size_t worker_limit = std::max<std::size_t>(1, std::min(parallelism, task_count));
+  std::deque<std::future<void>> pending_tasks;
+  std::size_t completed = 0;
+
+  auto finish_one = [&]() {
+    pending_tasks.front().get();
+    pending_tasks.pop_front();
+    ++completed;
+    print_progress(progress_name, completed, task_count);
+  };
+
+  for (std::size_t index = 0; index < task_count; ++index) {
+    Image image = decode_fn(index);
+    if (pending_tasks.size() >= worker_limit) {
+      finish_one();
+    }
+
+    pending_tasks.push_back(std::async(std::launch::async, [&, index, image = std::move(image)]() mutable {
+      slices[index] = render_fn(index, std::move(image), worker_limit > 1 ? 1U : parallelism);
+    }));
+  }
+
+  while (!pending_tasks.empty()) {
+    finish_one();
+  }
+
+  return slices;
+}
+
 void validate_dimensions(const std::vector<InputEntry> &entries) {
   if (entries.empty()) {
     fail("No input images available after filtering.");
@@ -953,36 +1160,104 @@ std::vector<InputEntry> select_preview(std::vector<InputEntry> entries, std::siz
   if (preview_count == 0 || preview_count >= entries.size()) {
     return entries;
   }
-  if (preview_count == 1) {
-    return {entries.front()};
-  }
 
   std::vector<InputEntry> selected;
+  const std::vector<std::size_t> indices = [&]() {
+    std::vector<std::size_t> result;
+    if (preview_count == 1) {
+      result.push_back(0);
+      return result;
+    }
+
+    result.reserve(preview_count);
+    std::size_t last_index = std::numeric_limits<std::size_t>::max();
+    for (std::size_t i = 0; i < preview_count; ++i) {
+      const double position = static_cast<double>(i) *
+                              static_cast<double>(entries.size() - 1) /
+                              static_cast<double>(preview_count - 1);
+      std::size_t index = static_cast<std::size_t>(std::llround(position));
+      if (index >= entries.size()) {
+        index = entries.size() - 1;
+      }
+      if (index == last_index) {
+        continue;
+      }
+      result.push_back(index);
+      last_index = index;
+    }
+
+    if (result.empty() || result.back() != entries.size() - 1) {
+      if (result.empty()) {
+        result.push_back(entries.size() - 1);
+      } else {
+        result.back() = entries.size() - 1;
+      }
+    }
+    return result;
+  }();
+
+  selected.reserve(indices.size());
+  for (std::size_t index : indices) {
+    selected.push_back(std::move(entries[index]));
+  }
+
+  return selected;
+}
+
+std::vector<Fs::path> select_preview_paths(std::vector<Fs::path> paths, std::size_t preview_count) {
+  if (preview_count == 0 || preview_count >= paths.size()) {
+    return paths;
+  }
+  if (preview_count == 1) {
+    return {std::move(paths.front())};
+  }
+
+  std::vector<Fs::path> selected;
   selected.reserve(preview_count);
   std::size_t last_index = std::numeric_limits<std::size_t>::max();
   for (std::size_t i = 0; i < preview_count; ++i) {
     const double position = static_cast<double>(i) *
-                            static_cast<double>(entries.size() - 1) /
+                            static_cast<double>(paths.size() - 1) /
                             static_cast<double>(preview_count - 1);
     std::size_t index = static_cast<std::size_t>(std::llround(position));
-    if (index >= entries.size()) {
-      index = entries.size() - 1;
+    if (index >= paths.size()) {
+      index = paths.size() - 1;
     }
     if (index == last_index) {
       continue;
     }
-    selected.push_back(entries[index]);
+    selected.push_back(std::move(paths[index]));
     last_index = index;
   }
 
-  if (selected.back().path != entries.back().path) {
-    selected.back() = entries.back();
+  if (selected.empty() || selected.back() != paths.back()) {
+    if (selected.empty()) {
+      selected.push_back(std::move(paths.back()));
+    } else {
+      selected.back() = std::move(paths.back());
+    }
   }
   return selected;
 }
 
 std::vector<InputEntry> gather_inputs(const Options &options) {
   std::vector<Fs::path> paths = list_input_files(options.input_dir);
+  auto by_name_path = [](const Fs::path &lhs, const Fs::path &rhs) {
+    const int cmp = compare_natural(lhs.filename().string(), rhs.filename().string());
+    if (cmp != 0) {
+      return cmp < 0;
+    }
+    return lhs.string() < rhs.string();
+  };
+
+  if (options.sort_mode == SortMode::kName) {
+    std::sort(paths.begin(), paths.end(), by_name_path);
+    if (options.reverse) {
+      std::reverse(paths.begin(), paths.end());
+    }
+    paths = select_preview_paths(std::move(paths), options.preview_count);
+  }
+
   std::vector<InputEntry> entries =
       parallel_load<InputEntry>(std::move(paths), options.parallelism, "scanning inputs", read_input_entry);
 
@@ -1009,11 +1284,13 @@ std::vector<InputEntry> gather_inputs(const Options &options) {
     return by_name(lhs, rhs);
   });
 
-  if (options.reverse) {
+  if (options.sort_mode != SortMode::kName && options.reverse) {
     std::reverse(entries.begin(), entries.end());
   }
 
-  entries = select_preview(std::move(entries), options.preview_count);
+  if (options.sort_mode != SortMode::kName) {
+    entries = select_preview(std::move(entries), options.preview_count);
+  }
   validate_dimensions(entries);
   return entries;
 }
@@ -1187,12 +1464,15 @@ void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::p
     fail("Unable to create alignment cache directory: " + cache_dir.string());
   }
 
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const Image image = load_image(entries[i].path);
+  run_overlapped_image_pipeline(
+      entries.size(), "preparing alignment cache",
+      [&](std::size_t i) {
+        return load_image_for_alignment(entries[i].path);
+      },
+      [&](std::size_t i, Image image) {
     const phasecorr::Image gray = to_phasecorr_image(image);
     write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
-    print_progress("preparing alignment cache", i + 1, entries.size());
-  }
+      });
 }
 
 Transform estimate_transform_for_angles(const phasecorr::Image &reference,
@@ -1245,16 +1525,28 @@ AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entr
     return alignment;
   }
 
+  const phasecorr::Image first_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, 0));
+  const double scale_x =
+      static_cast<double>(entries.front().width) / static_cast<double>(std::max(1, first_gray.cols));
+  const double scale_y =
+      static_cast<double>(entries.front().height) / static_cast<double>(std::max(1, first_gray.rows));
+
+  auto scale_transform = [&](Transform transform) {
+    transform.dx *= scale_x;
+    transform.dy *= scale_y;
+    return transform;
+  };
+
   const std::size_t task_count = entries.size() - 1;
   const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
   if (worker_count == 1) {
-    phasecorr::Image previous_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, 0));
+    phasecorr::Image previous_gray = first_gray;
     phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
     for (std::size_t index = 1; index < entries.size(); ++index) {
       phasecorr::Image current_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
       phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
-      const Transform delta =
-          estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half);
+      const Transform delta = scale_transform(
+          estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half));
       alignment.relative_transforms[index] = delta;
       print_alignment_progress(operation, index, task_count, delta);
       previous_gray = std::move(current_gray);
@@ -1291,8 +1583,8 @@ AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entr
         phasecorr::Image current_gray =
             read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
         phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
-        const Transform delta =
-            estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half);
+        const Transform delta = scale_transform(
+            estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half));
         alignment.relative_transforms[index] = delta;
         print_alignment_progress(operation, index, task_count, delta);
         previous_gray = std::move(current_gray);
@@ -1415,39 +1707,140 @@ std::array<double, 3> sample_rgb(const Image &image, double x, double y) {
   return result;
 }
 
-Image render_transformed_region(const Image &image,
-                                const Transform &transform,
-                                int origin_x,
-                                int origin_y,
-                                int width,
-                                int height) {
-  Image result{};
-  result.width = width;
-  result.height = height;
-  result.pixels.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U, 0);
+bool nearly_zero(double value, double epsilon = 1e-6) {
+  return std::abs(value) <= epsilon;
+}
+
+std::optional<int> near_integer_value(double value, double epsilon = 1e-6) {
+  const long rounded = std::lround(value);
+  if (std::abs(value - static_cast<double>(rounded)) > epsilon) {
+    return std::nullopt;
+  }
+  return static_cast<int>(rounded);
+}
+
+void copy_rgb_span(std::uint8_t *destination, const std::uint8_t *source, std::size_t pixel_count) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+  std::size_t offset = 0;
+  constexpr std::size_t simd_pixels = 16;
+  for (; offset + simd_pixels <= pixel_count; offset += simd_pixels) {
+    const uint8x16x3_t rgb = vld3q_u8(source + offset * 3U);
+    vst3q_u8(destination + offset * 3U, rgb);
+  }
+  if (offset < pixel_count) {
+    std::memcpy(destination + offset * 3U, source + offset * 3U, (pixel_count - offset) * 3U);
+  }
+#else
+  std::memcpy(destination, source, pixel_count * 3U);
+#endif
+}
+
+void render_integer_shift_rows(const Image &image,
+                               Image &result,
+                               int origin_x,
+                               int origin_y,
+                               int shift_x,
+                               int shift_y,
+                               int y_begin,
+                               int y_end) {
+  for (int y = y_begin; y < y_end; ++y) {
+    const int source_y = origin_y + y - shift_y;
+    if (source_y < 0 || source_y >= image.height) {
+      continue;
+    }
+
+    const int source_x_begin = origin_x - shift_x;
+    const int source_x_end = source_x_begin + result.width;
+    const int clamped_begin = std::max(0, source_x_begin);
+    const int clamped_end = std::min(image.width, source_x_end);
+    if (clamped_begin >= clamped_end) {
+      continue;
+    }
+
+    const int destination_x = clamped_begin - source_x_begin;
+    const std::size_t pixel_count = static_cast<std::size_t>(clamped_end - clamped_begin);
+    auto *destination_row = result.pixels.data() +
+                            (static_cast<std::size_t>(y) * static_cast<std::size_t>(result.width) +
+                             static_cast<std::size_t>(destination_x)) * 3U;
+    const auto *source_row = image.pixels.data() +
+                             (static_cast<std::size_t>(source_y) * static_cast<std::size_t>(image.width) +
+                              static_cast<std::size_t>(clamped_begin)) * 3U;
+    copy_rgb_span(destination_row, source_row, pixel_count);
+  }
+}
+
+void render_affine_rows(const Image &image,
+                        Image &result,
+                        const Transform &transform,
+                        int origin_x,
+                        int origin_y,
+                        int y_begin,
+                        int y_end) {
   const double cx = 0.5 * static_cast<double>(image.width - 1);
   const double cy = 0.5 * static_cast<double>(image.height - 1);
   const double radians = degrees_to_radians(transform.rotation_degrees);
   const double cosine = std::cos(radians);
   const double sine = std::sin(radians);
+  const double step_x_x = cosine;
+  const double step_x_y = -sine;
 
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      const double padded_x = static_cast<double>(origin_x + x);
-      const double padded_y = static_cast<double>(origin_y + y);
-      const double dest_dx = padded_x - cx - transform.dx;
-      const double dest_dy = padded_y - cy - transform.dy;
-      const double source_x = cosine * dest_dx + sine * dest_dy + cx;
-      const double source_y = -sine * dest_dx + cosine * dest_dy + cy;
+  for (int y = y_begin; y < y_end; ++y) {
+    const double padded_y = static_cast<double>(origin_y + y);
+    const double row_dest_dy = padded_y - cy - transform.dy;
+    double source_x = cosine * (static_cast<double>(origin_x) - cx - transform.dx) + sine * row_dest_dy + cx;
+    double source_y = -sine * (static_cast<double>(origin_x) - cx - transform.dx) + cosine * row_dest_dy + cy;
+
+    for (int x = 0; x < result.width; ++x) {
       const auto rgb = sample_rgb(image, source_x, source_y);
       const std::size_t destination_index =
-          (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+          (static_cast<std::size_t>(y) * static_cast<std::size_t>(result.width) +
            static_cast<std::size_t>(x)) * 3U;
       result.pixels[destination_index] = static_cast<std::uint8_t>(std::clamp(std::lround(rgb[0]), 0L, 255L));
-      result.pixels[destination_index + 1] = static_cast<std::uint8_t>(std::clamp(std::lround(rgb[1]), 0L, 255L));
-      result.pixels[destination_index + 2] = static_cast<std::uint8_t>(std::clamp(std::lround(rgb[2]), 0L, 255L));
+      result.pixels[destination_index + 1] =
+          static_cast<std::uint8_t>(std::clamp(std::lround(rgb[1]), 0L, 255L));
+      result.pixels[destination_index + 2] =
+          static_cast<std::uint8_t>(std::clamp(std::lround(rgb[2]), 0L, 255L));
+      source_x += step_x_x;
+      source_y += step_x_y;
     }
   }
+}
+
+Image render_transformed_region(const Image &image,
+                                const Transform &transform,
+                                int origin_x,
+                                int origin_y,
+                                int width,
+                                int height,
+                                std::size_t parallelism) {
+  Image result{};
+  result.width = width;
+  result.height = height;
+  result.pixels.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U, 0);
+
+  constexpr int minimum_rows_per_task = 32;
+  const std::size_t block_count = std::max<std::size_t>(
+      1, std::min<std::size_t>(parallelism, (static_cast<std::size_t>(height) + minimum_rows_per_task - 1) /
+                                                static_cast<std::size_t>(minimum_rows_per_task)));
+
+  if (nearly_zero(transform.rotation_degrees)) {
+    const auto shift_x = near_integer_value(transform.dx);
+    const auto shift_y = near_integer_value(transform.dy);
+    if (shift_x && shift_y) {
+      parallel_for_no_progress(block_count, parallelism, [&](std::size_t block_index) {
+        const int y_begin = static_cast<int>((block_index * static_cast<std::size_t>(height)) / block_count);
+        const int y_end = static_cast<int>(((block_index + 1) * static_cast<std::size_t>(height)) / block_count);
+        render_integer_shift_rows(image, result, origin_x, origin_y, *shift_x, *shift_y, y_begin, y_end);
+      });
+      return result;
+    }
+  }
+
+  parallel_for_no_progress(block_count, parallelism, [&](std::size_t block_index) {
+    const int y_begin = static_cast<int>((block_index * static_cast<std::size_t>(height)) / block_count);
+    const int y_end = static_cast<int>(((block_index + 1) * static_cast<std::size_t>(height)) / block_count);
+    render_affine_rows(image, result, transform, origin_x, origin_y, y_begin, y_end);
+  });
 
   return result;
 }
@@ -1460,16 +1853,20 @@ int slice_end(int extent, std::size_t count, std::size_t index) {
   return static_cast<int>(((index + 1) * static_cast<std::size_t>(extent)) / count);
 }
 
-Image extract_slice(const Image &image, std::size_t index, std::size_t count, SliceDirection direction) {
+Image extract_slice(const Image &image,
+                    std::size_t index,
+                    std::size_t count,
+                    SliceDirection direction,
+                    std::size_t parallelism) {
   if (direction == SliceDirection::kVertical) {
     const int x0 = slice_begin(image.width, count, index);
     const int x1 = slice_end(image.width, count, index);
-    return render_transformed_region(image, Transform{}, x0, 0, x1 - x0, image.height);
+    return render_transformed_region(image, Transform{}, x0, 0, x1 - x0, image.height, parallelism);
   }
 
   const int y0 = slice_begin(image.height, count, index);
   const int y1 = slice_end(image.height, count, index);
-  return render_transformed_region(image, Transform{}, 0, y0, image.width, y1 - y0);
+  return render_transformed_region(image, Transform{}, 0, y0, image.width, y1 - y0, parallelism);
 }
 
 Image render_transformed_slice(const Image &image,
@@ -1478,7 +1875,8 @@ Image render_transformed_slice(const Image &image,
                                SliceDirection direction,
                                const Transform &transform,
                                bool pad_result,
-                               CropRect crop_rect) {
+                               CropRect crop_rect,
+                               std::size_t parallelism) {
   const int output_width = pad_result ? image.width : crop_rect.width;
   const int output_height = pad_result ? image.height : crop_rect.height;
   const int origin_x = pad_result ? 0 : crop_rect.x;
@@ -1487,12 +1885,14 @@ Image render_transformed_slice(const Image &image,
   if (direction == SliceDirection::kVertical) {
     const int x0 = slice_begin(output_width, count, index);
     const int x1 = slice_end(output_width, count, index);
-    return render_transformed_region(image, transform, origin_x + x0, origin_y, x1 - x0, output_height);
+    return render_transformed_region(image, transform, origin_x + x0, origin_y, x1 - x0, output_height,
+                                     parallelism);
   }
 
   const int y0 = slice_begin(output_height, count, index);
   const int y1 = slice_end(output_height, count, index);
-  return render_transformed_region(image, transform, origin_x, origin_y + y0, output_width, y1 - y0);
+  return render_transformed_region(image, transform, origin_x, origin_y + y0, output_width, y1 - y0,
+                                   parallelism);
 }
 
 void write_alignment_json(const Fs::path &path,
@@ -1599,40 +1999,34 @@ Fs::path alignment_path_for(const Options &options, const Fs::path &temp_dir) {
   return output_directory(options.output_path) / "alignment.json";
 }
 
-Fs::path slice_path_for(const Fs::path &temp_dir, std::size_t index) {
-  std::ostringstream name;
-  name << "slice_" << std::setw(6) << std::setfill('0') << index << ".tiff";
-  return temp_dir / name.str();
+std::vector<Image> dump_slices_no_alignment(const std::vector<InputEntry> &entries,
+                                            SliceDirection direction,
+                                            std::size_t parallelism) {
+  return render_slices_in_memory(
+      entries.size(), parallelism, "dumping slices",
+      [&](std::size_t i) {
+        return load_image(entries[i].path);
+      },
+      [&](std::size_t i, Image image, std::size_t render_parallelism) {
+        return extract_slice(image, i, entries.size(), direction, render_parallelism);
+      });
 }
 
-void dump_slices_no_alignment(const std::vector<InputEntry> &entries,
-                              SliceDirection direction,
-                              const Fs::path &temp_dir,
-                              std::size_t parallelism) {
-  (void)parallelism;
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const Image image = load_image(entries[i].path);
-    const Image slice = extract_slice(image, i, entries.size(), direction);
-    write_tiff(slice_path_for(temp_dir, i), slice);
-    print_progress("dumping slices", i + 1, entries.size());
-  }
-}
-
-void dump_transformed_slices(const std::vector<InputEntry> &entries,
-                             const std::vector<Transform> &transforms,
-                             SliceDirection direction,
-                             bool pad_result,
-                             CropRect crop_rect,
-                             const Fs::path &temp_dir,
-                             std::size_t parallelism) {
-  (void)parallelism;
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const Image image = load_image(entries[i].path);
-    const Image slice =
-        render_transformed_slice(image, i, entries.size(), direction, transforms[i], pad_result, crop_rect);
-    write_tiff(slice_path_for(temp_dir, i), slice);
-    print_progress("dumping slices", i + 1, entries.size());
-  }
+std::vector<Image> dump_transformed_slices(const std::vector<InputEntry> &entries,
+                                           const std::vector<Transform> &transforms,
+                                           SliceDirection direction,
+                                           bool pad_result,
+                                           CropRect crop_rect,
+                                           std::size_t parallelism) {
+  return render_slices_in_memory(
+      entries.size(), parallelism, "dumping slices",
+      [&](std::size_t i) {
+        return load_image(entries[i].path);
+      },
+      [&](std::size_t i, Image image, std::size_t render_parallelism) {
+        return render_transformed_slice(image, i, entries.size(), direction, transforms[i], pad_result, crop_rect,
+                                        render_parallelism);
+      });
 }
 
 class ScanlineWriter {
@@ -1743,71 +2137,8 @@ std::unique_ptr<ScanlineWriter> open_output_writer(const Fs::path &path,
   fail("Unsupported output format. Use .jpg, .jpeg, .tif, or .tiff.");
 }
 
-class TiffSliceReader {
-public:
-  explicit TiffSliceReader(const Fs::path &path) {
-    tiff_ = TIFFOpen(path.string().c_str(), "r");
-    if (tiff_ == nullptr) {
-      fail("Unable to open TIFF file: " + path.string());
-    }
-
-    std::uint32_t raw_width = 0;
-    std::uint32_t raw_height = 0;
-    std::uint16_t samples_per_pixel = 0;
-    std::uint16_t bits_per_sample = 0;
-    std::uint16_t planar_config = 0;
-    std::uint16_t photometric = 0;
-    if (TIFFGetField(tiff_, TIFFTAG_IMAGEWIDTH, &raw_width) != 1 ||
-        TIFFGetField(tiff_, TIFFTAG_IMAGELENGTH, &raw_height) != 1 ||
-        TIFFGetField(tiff_, TIFFTAG_SAMPLESPERPIXEL, &samples_per_pixel) != 1 ||
-        TIFFGetField(tiff_, TIFFTAG_BITSPERSAMPLE, &bits_per_sample) != 1 ||
-        TIFFGetField(tiff_, TIFFTAG_PLANARCONFIG, &planar_config) != 1 ||
-        TIFFGetField(tiff_, TIFFTAG_PHOTOMETRIC, &photometric) != 1) {
-      TIFFClose(tiff_);
-      fail("Unable to read TIFF metadata: " + path.string());
-    }
-
-    if (samples_per_pixel != 3 || bits_per_sample != 8 ||
-        planar_config != PLANARCONFIG_CONTIG || photometric != PHOTOMETRIC_RGB) {
-      TIFFClose(tiff_);
-      fail("Unsupported TIFF layout: " + path.string());
-    }
-
-    width_ = static_cast<int>(raw_width);
-    height_ = static_cast<int>(raw_height);
-  }
-
-  ~TiffSliceReader() {
-    if (tiff_ != nullptr) {
-      TIFFClose(tiff_);
-    }
-  }
-
-  int width() const {
-    return width_;
-  }
-
-  int height() const {
-    return height_;
-  }
-
-  void read_next_row(std::span<std::uint8_t> row) {
-    if (TIFFReadScanline(tiff_, row.data(), next_row_, 0) < 0) {
-      fail("Unable to read TIFF scanline from slice.");
-    }
-    ++next_row_;
-  }
-
-private:
-  TIFF *tiff_ = nullptr;
-  int width_ = 0;
-  int height_ = 0;
-  std::uint32_t next_row_ = 0;
-};
-
-void merge_slices_to_output(const std::vector<InputEntry> &entries,
+void merge_slices_to_output(const std::vector<Image> &slices,
                             SliceDirection direction,
-                            const Fs::path &temp_dir,
                             const Fs::path &output_path,
                             int output_width,
                             int output_height,
@@ -1818,26 +2149,21 @@ void merge_slices_to_output(const std::vector<InputEntry> &entries,
   print_progress_percent_5("merging slices", 0, static_cast<std::size_t>(output_height), last_percent_bucket);
 
   if (direction == SliceDirection::kVertical) {
-    std::vector<std::unique_ptr<TiffSliceReader>> readers;
-    readers.reserve(entries.size());
-    std::vector<std::vector<std::uint8_t>> slice_rows;
-    slice_rows.reserve(entries.size());
-
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      readers.push_back(std::make_unique<TiffSliceReader>(slice_path_for(temp_dir, i)));
-      if (readers.back()->height() != output_height) {
+    for (const Image &slice : slices) {
+      if (slice.height != output_height) {
         fail("Slice height does not match output height.");
       }
-      slice_rows.emplace_back(static_cast<std::size_t>(readers.back()->width()) * 3U);
     }
 
     for (int row = 0; row < output_height; ++row) {
       std::size_t offset = 0;
-      for (std::size_t i = 0; i < readers.size(); ++i) {
-        readers[i]->read_next_row(slice_rows[i]);
-        std::copy(slice_rows[i].begin(), slice_rows[i].end(),
+      for (const Image &slice : slices) {
+        const std::size_t row_width = static_cast<std::size_t>(slice.width) * 3U;
+        const auto row_begin =
+            slice.pixels.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(row) * row_width);
+        std::copy(row_begin, row_begin + static_cast<std::ptrdiff_t>(row_width),
                   output_row.begin() + static_cast<std::ptrdiff_t>(offset));
-        offset += slice_rows[i].size();
+        offset += row_width;
       }
       writer->write_row(output_row);
       print_progress_percent_5("merging slices", static_cast<std::size_t>(row + 1),
@@ -1847,14 +2173,16 @@ void merge_slices_to_output(const std::vector<InputEntry> &entries,
   }
 
   std::size_t written_rows = 0;
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    TiffSliceReader reader(slice_path_for(temp_dir, i));
-    if (reader.width() != output_width) {
+  for (const Image &slice : slices) {
+    if (slice.width != output_width) {
       fail("Slice width does not match output width.");
     }
 
-    for (int row = 0; row < reader.height(); ++row) {
-      reader.read_next_row(output_row);
+    const std::size_t row_width = static_cast<std::size_t>(slice.width) * 3U;
+    for (int row = 0; row < slice.height; ++row) {
+      const auto row_begin =
+          slice.pixels.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(row) * row_width);
+      std::copy(row_begin, row_begin + static_cast<std::ptrdiff_t>(row_width), output_row.begin());
       writer->write_row(output_row);
       ++written_rows;
       print_progress_percent_5("merging slices", written_rows, static_cast<std::size_t>(output_height),
@@ -1866,8 +2194,9 @@ void merge_slices_to_output(const std::vector<InputEntry> &entries,
 AlignmentData load_or_compute_alignment(const Fs::path &alignment_path,
                                         const Fs::path &alignment_cache_dir,
                                         const std::vector<InputEntry> &entries,
-                                        std::size_t parallelism) {
-  if (Fs::exists(alignment_path)) {
+                                        std::size_t parallelism,
+                                        bool reuse_existing_alignment) {
+  if (reuse_existing_alignment && Fs::exists(alignment_path)) {
     print_progress("loading alignment checkpoint", 1, 1);
     return read_alignment_json(alignment_path, entries);
   }
@@ -1889,23 +2218,25 @@ void run_pipeline(const Options &options, const std::vector<InputEntry> &entries
   int output_width = base_width;
   int output_height = base_height;
   CropRect crop_rect{};
+  std::vector<Image> slices;
 
   if (!options.auto_align) {
-    dump_slices_no_alignment(entries, options.direction, temp_dir, options.parallelism);
+    slices = dump_slices_no_alignment(entries, options.direction, options.parallelism);
   } else {
     const AlignmentData alignment =
-        load_or_compute_alignment(alignment_path, alignment_cache_dir, entries, options.parallelism);
+        load_or_compute_alignment(alignment_path, alignment_cache_dir, entries, options.parallelism,
+                                  !options.alignment_json_path.empty());
     if (!options.pad_result) {
       crop_rect = compute_crop_rect(base_width, base_height, alignment.total_transforms);
       output_width = crop_rect.width;
       output_height = crop_rect.height;
     }
-    dump_transformed_slices(entries, alignment.total_transforms, options.direction, options.pad_result,
-                            crop_rect, temp_dir, options.parallelism);
+    slices = dump_transformed_slices(entries, alignment.total_transforms, options.direction, options.pad_result,
+                                     crop_rect, options.parallelism);
   }
 
-  merge_slices_to_output(entries, options.direction, temp_dir, options.output_path, output_width,
-                         output_height, options.jpeg_quality);
+  merge_slices_to_output(slices, options.direction, options.output_path, output_width, output_height,
+                         options.jpeg_quality);
 }
 
 }  // namespace

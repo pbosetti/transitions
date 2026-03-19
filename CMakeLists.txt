@@ -12,10 +12,12 @@ pkg_check_modules(LIBRAW REQUIRED IMPORTED_TARGET libraw_r)
 pkg_check_modules(LIBTIFF REQUIRED IMPORTED_TARGET libtiff-4)
 pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json)
 
-# Use system FFTW3 (single precision)
+# Use system-installed FFTW3 (single precision) and Eigen3 rather than
+# downloading them via FetchContent.  On macOS install with:
+#   brew install fftw eigen
+# On Debian/Ubuntu:
+#   apt-get install libfftw3-dev libeigen3-dev
 pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
-
-# Use system Eigen3
 find_package(Eigen3 REQUIRED)
 
 add_executable(transitions

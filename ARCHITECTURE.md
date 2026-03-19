@@ -172,12 +172,13 @@ This stage is format-agnostic apart from the scanline writer implementation, whi
 
 ## Concurrency and staging
 
-The architecture uses concurrency selectively rather than uniformly.
+The architecture uses concurrency throughout the pipeline.
 
-- Metadata scanning is currently implemented sequentially even though the API exposes a `parallelism` parameter.
-- Slice rendering can overlap decode and render work using asynchronous tasks, while bounding the number of pending tasks.
+- Metadata scanning uses `parallel_load` with a worker-stealing thread pool bounded by `--parallel`.
+- Alignment cache preparation decodes all N images concurrently: each worker thread decodes one image to half-resolution grayscale and writes the binary cache file. libjpeg-turbo and LibRaw (the `_r` reentrant variant) are both thread-safe per-instance, so no serializing locks are needed.
+- The rotation search within each image pair runs the 11 coarse angles and 9 fine angles in parallel using the same worker pool. Because each angle test only reads the reference and candidate images (it creates its own rotated copy), the tests are fully independent.
+- Alignment computation can be split into chunks, each still processing a consecutive subsequence because pairwise registration depends on the previous frame.
 - Pixel work inside transformed rendering can be split into row blocks.
-- Alignment computation can be split into chunks, but each chunk still processes a consecutive subsequence because pairwise registration depends on the previous frame.
 
 The important design principle is pipeline overlap: decode one image, render or cache it asynchronously, then continue decoding the next image. This reduces idle time without requiring the whole sequence to be resident in memory at once during every stage.
 
@@ -222,7 +223,9 @@ Several implementation choices reduce those costs:
 
 - Alignment runs on half-resolution decoded images.
 - A coarse-to-fine angle search avoids evaluating the full-resolution image at every coarse angle.
+- Both the coarse and fine angle passes run in parallel: each of the `--parallel` threads tests one candidate rotation independently, since each rotation only reads the shared reference and candidate images and creates its own rotated copy.
+- Alignment cache preparation decodes all images concurrently across `--parallel` threads (the global serializing locks around libjpeg and LibRaw were removed because both are thread-safe per-instance).
 - Integer-translation rendering uses direct row copies instead of interpolation.
 - Output is written as scanlines rather than constructing a second full-size output buffer.
 
-Even with these optimizations, the alignment path remains substantially more expensive than direct slicing because it performs multiple FFT-based registrations per adjacent image pair. In asymptotic terms, if `N` is the number of images, `A` is the number of tested angles, and `P` is the number of pixels in an alignment image, the alignment stage is roughly proportional to `O(N * A * P log P)`, while the final rendering stage is roughly linear in the number of output pixels sampled.
+Even with these optimizations, the alignment path remains substantially more expensive than direct slicing because it performs multiple FFT-based registrations per adjacent image pair. In asymptotic terms, if `N` is the number of images, `A` is the number of tested angles, `P` is the number of pixels in an alignment image, and `T` is the number of parallel threads, the alignment stage is roughly proportional to `O(N * ceil(A / T) * P log P / T)`, while the final rendering stage is roughly linear in the number of output pixels sampled.

@@ -1571,11 +1571,9 @@ AlignmentData concurrent_alignment_pipeline(
 
   // scale_x/scale_y: ratio of full-res to half-res dimensions, used to convert
   // phase-correlation shifts (measured on half-res cached images) back to full-res pixels.
-  // The defaults (2.0) are overwritten by the image-0 decode task before any alignment
-  // task can read them (alignment tasks wait on cache_futures[0] via i-1 or the busy-wait).
-  std::atomic<double> scale_x{2.0};
-  std::atomic<double> scale_y{2.0};
-  std::atomic<bool> scale_computed{false};
+  // Computed once by the image-0 decode task and signalled via a promise/shared_future.
+  std::promise<std::pair<double, double>> scale_promise;
+  std::shared_future<std::pair<double, double>> scale_future = scale_promise.get_future().share();
 
   // cache_ready[i] becomes ready when image i has been decoded and written to disk
   std::vector<std::promise<bool>> cache_promises(n);
@@ -1601,13 +1599,11 @@ AlignmentData concurrent_alignment_pipeline(
 
       // Only image 0 computes scale; exactly one task has i==0 so no races on the write.
       if (i == 0) {
-        scale_x.store(static_cast<double>(entries[0].width) /
-                      static_cast<double>(std::max(1, gray.cols)),
-                      std::memory_order_release);
-        scale_y.store(static_cast<double>(entries[0].height) /
-                      static_cast<double>(std::max(1, gray.rows)),
-                      std::memory_order_release);
-        scale_computed.store(true, std::memory_order_release);
+        const double sx = static_cast<double>(entries[0].width) /
+                          static_cast<double>(std::max(1, gray.cols));
+        const double sy = static_cast<double>(entries[0].height) /
+                          static_cast<double>(std::max(1, gray.rows));
+        scale_promise.set_value({sx, sy});
       }
 
       write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
@@ -1621,11 +1617,8 @@ AlignmentData concurrent_alignment_pipeline(
       cache_futures[i - 1].wait();
       cache_futures[i].wait();
 
-      // For pairs not involving image 0 both neighbours may be ready before image 0 has
-      // set scale; the busy-wait below exits quickly since decode tasks are short-lived.
-      while (!scale_computed.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
+      // Wait for scale (computed by image-0 decode task) using a future — no busy-wait.
+      const auto [sx, sy] = scale_future.get();
 
       const phasecorr::Image ref_gray =
           read_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i - 1));
@@ -1640,8 +1633,8 @@ AlignmentData concurrent_alignment_pipeline(
           estimate_transform_phase_corr(ref_gray, cand_gray, ref_gray_half, cand_gray_half, 1);
 
       Transform delta = raw_delta;
-      delta.dx *= scale_x.load(std::memory_order_acquire);
-      delta.dy *= scale_y.load(std::memory_order_acquire);
+      delta.dx *= sx;
+      delta.dy *= sy;
 
       alignment.relative_transforms[i] = delta;
 

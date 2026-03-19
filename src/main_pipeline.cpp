@@ -18,6 +18,7 @@
 #include <ctime>
 #include <deque>
 #include <filesystem>
+#include <queue>
 #include <fstream>
 #include <future>
 #include <iomanip>
@@ -1049,6 +1050,61 @@ void parallel_for_no_progress(std::size_t task_count, std::size_t parallelism, W
   }
 }
 
+class ThreadPool {
+public:
+  explicit ThreadPool(std::size_t n_threads) : stop_(false) {
+    for (std::size_t i = 0; i < n_threads; ++i) {
+      workers_.emplace_back([this]() { worker_loop(); });
+    }
+  }
+
+  ~ThreadPool() {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto &w : workers_) {
+      if (w.joinable()) w.join();
+    }
+  }
+
+  template <typename F>
+  std::future<std::invoke_result_t<F>> submit(F &&f) {
+    using R = std::invoke_result_t<F>;
+    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
+    std::future<R> future = task->get_future();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) throw std::runtime_error("ThreadPool is stopped.");
+      queue_.push([task]() { (*task)(); });
+    }
+    cv_.notify_one();
+    return future;
+  }
+
+private:
+  void worker_loop() {
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+        if (stop_ && queue_.empty()) return;
+        task = std::move(queue_.front());
+        queue_.pop();
+      }
+      task();
+    }
+  }
+
+  std::vector<std::thread> workers_;
+  std::queue<std::function<void()>> queue_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_;
+};
+
 template <typename Decoder, typename Processor>
 void run_overlapped_image_pipeline(std::size_t task_count,
                                    std::string_view progress_name,
@@ -1439,21 +1495,6 @@ phasecorr::Image read_gray_image_cache(const Fs::path &path) {
   return image;
 }
 
-void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::path &cache_dir,
-                             std::size_t parallelism) {
-  std::error_code ec;
-  Fs::create_directories(cache_dir, ec);
-  if (ec) {
-    fail("Unable to create alignment cache directory: " + cache_dir.string());
-  }
-
-  parallel_for(entries.size(), parallelism, "preparing alignment cache", [&](std::size_t i) {
-    const Image image = load_image_for_alignment(entries[i].path);
-    const phasecorr::Image gray = to_phasecorr_image(image);
-    write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
-  });
-}
-
 Transform estimate_transform_for_angles(const phasecorr::Image &reference,
                                         const phasecorr::Image &candidate,
                                         std::span<const double> angles,
@@ -1509,101 +1550,101 @@ Transform estimate_transform_phase_corr(const phasecorr::Image &ref_gray,
   return estimate_transform_for_angles(ref_gray, cand_gray, refinement_angles, parallelism);
 }
 
-AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entries,
-                                             const Fs::path &alignment_cache_dir,
-                                             std::size_t parallelism,
-                                             std::string_view operation) {
+AlignmentData concurrent_alignment_pipeline(
+    const std::vector<InputEntry> &entries,
+    const Fs::path &cache_dir,
+    std::size_t parallelism) {
+
+  const std::size_t n = entries.size();
+
   AlignmentData alignment{};
-  alignment.relative_transforms.assign(entries.size(), Transform{});
-  if (entries.size() <= 1) {
-    alignment.total_transforms.assign(entries.size(), Transform{});
+  alignment.relative_transforms.assign(n, Transform{});
+
+  if (n <= 1) {
+    alignment.total_transforms.assign(n, Transform{});
     return alignment;
   }
 
-  const phasecorr::Image first_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, 0));
-  const double scale_x =
-      static_cast<double>(entries.front().width) / static_cast<double>(std::max(1, first_gray.cols));
-  const double scale_y =
-      static_cast<double>(entries.front().height) / static_cast<double>(std::max(1, first_gray.rows));
+  std::error_code ec;
+  Fs::create_directories(cache_dir, ec);
+  if (ec) fail("Unable to create alignment cache directory: " + cache_dir.string());
 
-  auto scale_transform = [&](Transform transform) {
-    transform.dx *= scale_x;
-    transform.dy *= scale_y;
-    return transform;
-  };
+  // scale_x/scale_y: ratio of full-res to half-res dimensions, used to convert
+  // phase-correlation shifts (measured on half-res cached images) back to full-res pixels.
+  // Computed once by the image-0 decode task and signalled via a promise/shared_future.
+  std::promise<std::pair<double, double>> scale_promise;
+  std::shared_future<std::pair<double, double>> scale_future = scale_promise.get_future().share();
 
-  const std::size_t task_count = entries.size() - 1;
-  const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
-  if (worker_count == 1) {
-    phasecorr::Image previous_gray = first_gray;
-    phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
-    for (std::size_t index = 1; index < entries.size(); ++index) {
-      phasecorr::Image current_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
-      phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
-      const Transform delta = scale_transform(
-          estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half, parallelism));
-      alignment.relative_transforms[index] = delta;
-      print_alignment_progress(operation, index, task_count, delta);
-      previous_gray = std::move(current_gray);
-      previous_gray_half = std::move(current_gray_half);
-    }
-    alignment.total_transforms = accumulate_total_transforms(alignment.relative_transforms);
-    return alignment;
+  // cache_ready[i] becomes ready when image i has been decoded and written to disk
+  std::vector<std::promise<bool>> cache_promises(n);
+  std::vector<std::shared_future<bool>> cache_futures;
+  cache_futures.reserve(n);
+  for (auto &p : cache_promises) {
+    cache_futures.push_back(p.get_future().share());
   }
 
-  const std::size_t chunk_size = (task_count + worker_count - 1) / worker_count;
-  std::mutex error_mutex;
-  std::exception_ptr first_error;
+  std::atomic<std::size_t> alignment_done{0};
+  const std::size_t alignment_total = n - 1;
 
-  auto worker = [&](std::size_t worker_index) {
-    const std::size_t start_index = 1 + worker_index * chunk_size;
-    if (start_index >= entries.size()) {
-      return;
-    }
-    const std::size_t end_index = std::min(task_count, start_index + chunk_size - 1);
+  const std::size_t pool_threads = std::max<std::size_t>(1, parallelism);
+  ThreadPool pool(pool_threads);
+  std::vector<std::future<void>> all_tasks;
+  all_tasks.reserve(n + (n - 1));
 
-    try {
-      phasecorr::Image previous_gray =
-          read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, start_index - 1));
-      phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
+  // Decode + cache tasks: each decodes one image at half-res and writes it to disk
+  for (std::size_t i = 0; i < n; ++i) {
+    all_tasks.push_back(pool.submit([&, i]() {
+      const Image img = load_image_for_alignment(entries[i].path);
+      const phasecorr::Image gray = to_phasecorr_image(img);
 
-      for (std::size_t index = start_index; index <= end_index; ++index) {
-        {
-          std::lock_guard<std::mutex> lock(error_mutex);
-          if (first_error) {
-            return;
-          }
-        }
-
-        phasecorr::Image current_gray =
-            read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
-        phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
-        const Transform delta = scale_transform(
-            estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half, parallelism));
-        alignment.relative_transforms[index] = delta;
-        print_alignment_progress(operation, index, task_count, delta);
-        previous_gray = std::move(current_gray);
-        previous_gray_half = std::move(current_gray_half);
+      // Only image 0 computes scale; exactly one task has i==0 so no races on the write.
+      if (i == 0) {
+        const double sx = static_cast<double>(entries[0].width) /
+                          static_cast<double>(std::max(1, gray.cols));
+        const double sy = static_cast<double>(entries[0].height) /
+                          static_cast<double>(std::max(1, gray.rows));
+        scale_promise.set_value({sx, sy});
       }
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(error_mutex);
-      if (!first_error) {
-        first_error = std::current_exception();
-      }
-    }
-  };
 
-  std::vector<std::thread> workers;
-  workers.reserve(worker_count);
-  for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
-    workers.emplace_back(worker, worker_index);
-  }
-  for (auto &worker_thread : workers) {
-    worker_thread.join();
+      write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
+      cache_promises[i].set_value(true);
+    }));
   }
 
-  if (first_error) {
-    std::rethrow_exception(first_error);
+  // Alignment tasks: each waits for its two neighbours to be cached, then aligns
+  for (std::size_t i = 1; i < n; ++i) {
+    all_tasks.push_back(pool.submit([&, i]() {
+      cache_futures[i - 1].wait();
+      cache_futures[i].wait();
+
+      // Wait for scale (computed by image-0 decode task) using a future — no busy-wait.
+      const auto [sx, sy] = scale_future.get();
+
+      const phasecorr::Image ref_gray =
+          read_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i - 1));
+      const phasecorr::Image cand_gray =
+          read_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i));
+      const phasecorr::Image ref_gray_half = downsample_phasecorr_image_half(ref_gray);
+      const phasecorr::Image cand_gray_half = downsample_phasecorr_image_half(cand_gray);
+
+      // Pass parallelism=1: the pool already provides pair-level parallelism, so
+      // spawning additional threads per task would oversubscribe the CPU.
+      const Transform raw_delta =
+          estimate_transform_phase_corr(ref_gray, cand_gray, ref_gray_half, cand_gray_half, 1);
+
+      Transform delta = raw_delta;
+      delta.dx *= sx;
+      delta.dy *= sy;
+
+      alignment.relative_transforms[i] = delta;
+
+      const std::size_t done = alignment_done.fetch_add(1) + 1;
+      print_alignment_progress("auto alignment", done, alignment_total, delta);
+    }));
+  }
+
+  for (auto &f : all_tasks) {
+    f.get();
   }
 
   alignment.total_transforms = accumulate_total_transforms(alignment.relative_transforms);
@@ -2196,9 +2237,8 @@ AlignmentData load_or_compute_alignment(const Fs::path &alignment_path,
     return read_alignment_json(alignment_path, entries);
   }
 
-  prepare_alignment_cache(entries, alignment_cache_dir, parallelism);
   const AlignmentData alignment =
-      compute_alignment_from_entries(entries, alignment_cache_dir, parallelism, "auto alignment");
+      concurrent_alignment_pipeline(entries, alignment_cache_dir, parallelism);
   write_alignment_json(alignment_path, entries, alignment);
   return alignment;
 }

@@ -44,21 +44,6 @@ namespace Fs = std::filesystem;
 
 namespace {
 
-std::mutex &jpeg_mutex() {
-  static auto *mutex = new std::mutex();
-  return *mutex;
-}
-
-std::mutex &libraw_mutex() {
-  static auto *mutex = new std::mutex();
-  return *mutex;
-}
-
-std::mutex &tiff_mutex() {
-  static auto *mutex = new std::mutex();
-  return *mutex;
-}
-
 enum class SortMode {
   kName,
   kCaptureTime,
@@ -579,7 +564,6 @@ void jpeg_error_exit(j_common_ptr cinfo) {
 }
 
 InputEntry read_jpeg_entry(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(jpeg_mutex());
   FILE *file = std::fopen(path.string().c_str(), "rb");
   if (file == nullptr) {
     fail("Unable to open JPEG file: " + path.string());
@@ -624,7 +608,6 @@ InputEntry read_jpeg_entry(const Fs::path &path) {
 }
 
 InputEntry read_dng_entry(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(libraw_mutex());
   LibRaw raw_processor;
   int result = raw_processor.open_file(path.string().c_str());
   if (result != LIBRAW_SUCCESS) {
@@ -660,7 +643,6 @@ InputEntry read_input_entry(const Fs::path &path) {
 }
 
 Image load_jpeg_image(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(jpeg_mutex());
   FILE *file = std::fopen(path.string().c_str(), "rb");
   if (file == nullptr) {
     fail("Unable to open JPEG file: " + path.string());
@@ -703,7 +685,6 @@ Image load_jpeg_image(const Fs::path &path) {
 }
 
 Image load_jpeg_image_for_alignment(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(jpeg_mutex());
   FILE *file = std::fopen(path.string().c_str(), "rb");
   if (file == nullptr) {
     fail("Unable to open JPEG file: " + path.string());
@@ -748,7 +729,6 @@ Image load_jpeg_image_for_alignment(const Fs::path &path) {
 }
 
 Image load_dng_image(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(libraw_mutex());
   LibRaw raw_processor;
 
   int result = raw_processor.open_file(path.string().c_str());
@@ -792,7 +772,6 @@ Image load_dng_image(const Fs::path &path) {
 }
 
 Image load_dng_image_for_alignment(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(libraw_mutex());
   LibRaw raw_processor;
 
   int result = raw_processor.open_file(path.string().c_str());
@@ -837,7 +816,6 @@ Image load_dng_image_for_alignment(const Fs::path &path) {
 }
 
 Image load_tiff_image(const Fs::path &path) {
-  std::lock_guard<std::mutex> lock(tiff_mutex());
   TIFF *tiff = TIFFOpen(path.string().c_str(), "r");
   if (tiff == nullptr) {
     fail("Unable to open TIFF file: " + path.string());
@@ -938,11 +916,9 @@ template <typename T, typename Loader>
 std::vector<T> parallel_load(std::vector<Fs::path> paths, std::size_t parallelism,
                              std::string_view progress_name, Loader loader) {
   std::vector<T> results(paths.size());
-  (void)parallelism;
-  for (std::size_t index = 0; index < paths.size(); ++index) {
+  parallel_for(paths.size(), parallelism, progress_name, [&](std::size_t index) {
     results[index] = loader(paths[index]);
-    print_progress(progress_name, index + 1, paths.size());
-  }
+  });
   return results;
 }
 
@@ -1457,7 +1433,9 @@ phasecorr::Image read_gray_image_cache(const Fs::path &path) {
   return image;
 }
 
-void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::path &cache_dir) {
+void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::path &cache_dir,
+                             std::size_t parallelism) {
+  (void)parallelism;
   std::error_code ec;
   Fs::create_directories(cache_dir, ec);
   if (ec) {
@@ -1470,20 +1448,21 @@ void prepare_alignment_cache(const std::vector<InputEntry> &entries, const Fs::p
         return load_image_for_alignment(entries[i].path);
       },
       [&](std::size_t i, Image image) {
-    const phasecorr::Image gray = to_phasecorr_image(image);
-    write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
+        const phasecorr::Image gray = to_phasecorr_image(image);
+        write_gray_image_cache(alignment_gray_cache_path_for(cache_dir, i), gray);
       });
 }
 
 Transform estimate_transform_for_angles(const phasecorr::Image &reference,
                                         const phasecorr::Image &candidate,
-                                        std::span<const double> angles) {
+                                        std::span<const double> angles,
+                                        phasecorr::FftwContext &ctx) {
   Transform best{};
   double best_peak = -std::numeric_limits<double>::infinity();
 
   for (double angle : angles) {
     const phasecorr::Image rotated = rotate_phasecorr_image(candidate, angle);
-    const phasecorr::PhaseCorrelationResult result = phasecorr::phaseCorrelation(reference, rotated);
+    const phasecorr::PhaseCorrelationResult result = phasecorr::phaseCorrelation(ctx, reference, rotated);
     if (result.peak > best_peak) {
       best_peak = result.peak;
       best.dx = result.shift.x();
@@ -1498,20 +1477,22 @@ Transform estimate_transform_for_angles(const phasecorr::Image &reference,
 Transform estimate_transform_phase_corr(const phasecorr::Image &ref_gray,
                                         const phasecorr::Image &cand_gray,
                                         const phasecorr::Image &ref_gray_half,
-                                        const phasecorr::Image &cand_gray_half) {
+                                        const phasecorr::Image &cand_gray_half,
+                                        phasecorr::FftwContext &ctx_full,
+                                        phasecorr::FftwContext &ctx_half) {
   static constexpr std::array<double, 11> coarse_angles = {
       -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
   static constexpr std::array<double, 9> refinement_offsets = {
       -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4};
 
-  const Transform coarse = estimate_transform_for_angles(ref_gray_half, cand_gray_half, coarse_angles);
+  const Transform coarse = estimate_transform_for_angles(ref_gray_half, cand_gray_half, coarse_angles, ctx_half);
 
   std::array<double, refinement_offsets.size()> refinement_angles{};
   for (std::size_t i = 0; i < refinement_offsets.size(); ++i) {
     refinement_angles[i] = coarse.rotation_degrees + refinement_offsets[i];
   }
 
-  return estimate_transform_for_angles(ref_gray, cand_gray, refinement_angles);
+  return estimate_transform_for_angles(ref_gray, cand_gray, refinement_angles, ctx_full);
 }
 
 AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entries,
@@ -1525,7 +1506,8 @@ AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entr
     return alignment;
   }
 
-  const phasecorr::Image first_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, 0));
+  const phasecorr::Image first_gray = read_gray_image_cache(
+      alignment_gray_cache_path_for(alignment_cache_dir, 0));
   const double scale_x =
       static_cast<double>(entries.front().width) / static_cast<double>(std::max(1, first_gray.cols));
   const double scale_y =
@@ -1539,19 +1521,38 @@ AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entr
 
   const std::size_t task_count = entries.size() - 1;
   const std::size_t worker_count = std::max<std::size_t>(1, std::min(parallelism, task_count));
-  if (worker_count == 1) {
-    phasecorr::Image previous_gray = first_gray;
+
+  // Per-worker body: process a consecutive range of pairs using a reusable
+  // FftwContext so that plan creation and buffer allocation happen once per
+  // worker rather than once per phase-correlation call.
+  auto process_range = [&](std::size_t start_index, std::size_t end_index) {
+    phasecorr::Image previous_gray =
+        read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, start_index - 1));
     phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
-    for (std::size_t index = 1; index < entries.size(); ++index) {
-      phasecorr::Image current_gray = read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
+
+    // Create reusable FFTW contexts once for this worker's image sizes.
+    phasecorr::FftwContext ctx_full(previous_gray.rows, previous_gray.cols);
+    phasecorr::FftwContext ctx_half(previous_gray_half.rows, previous_gray_half.cols);
+
+    for (std::size_t index = start_index; index <= end_index; ++index) {
+      phasecorr::Image current_gray =
+          read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
       phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
+
       const Transform delta = scale_transform(
-          estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half));
+          estimate_transform_phase_corr(previous_gray, current_gray,
+                                        previous_gray_half, current_gray_half,
+                                        ctx_full, ctx_half));
       alignment.relative_transforms[index] = delta;
       print_alignment_progress(operation, index, task_count, delta);
+
       previous_gray = std::move(current_gray);
       previous_gray_half = std::move(current_gray_half);
     }
+  };
+
+  if (worker_count == 1) {
+    process_range(1, task_count);
     alignment.total_transforms = accumulate_total_transforms(alignment.relative_transforms);
     return alignment;
   }
@@ -1568,28 +1569,7 @@ AlignmentData compute_alignment_from_entries(const std::vector<InputEntry> &entr
     const std::size_t end_index = std::min(task_count, start_index + chunk_size - 1);
 
     try {
-      phasecorr::Image previous_gray =
-          read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, start_index - 1));
-      phasecorr::Image previous_gray_half = downsample_phasecorr_image_half(previous_gray);
-
-      for (std::size_t index = start_index; index <= end_index; ++index) {
-        {
-          std::lock_guard<std::mutex> lock(error_mutex);
-          if (first_error) {
-            return;
-          }
-        }
-
-        phasecorr::Image current_gray =
-            read_gray_image_cache(alignment_gray_cache_path_for(alignment_cache_dir, index));
-        phasecorr::Image current_gray_half = downsample_phasecorr_image_half(current_gray);
-        const Transform delta = scale_transform(
-            estimate_transform_phase_corr(previous_gray, current_gray, previous_gray_half, current_gray_half));
-        alignment.relative_transforms[index] = delta;
-        print_alignment_progress(operation, index, task_count, delta);
-        previous_gray = std::move(current_gray);
-        previous_gray_half = std::move(current_gray_half);
-      }
+      process_range(start_index, end_index);
     } catch (...) {
       std::lock_guard<std::mutex> lock(error_mutex);
       if (!first_error) {
@@ -2201,7 +2181,7 @@ AlignmentData load_or_compute_alignment(const Fs::path &alignment_path,
     return read_alignment_json(alignment_path, entries);
   }
 
-  prepare_alignment_cache(entries, alignment_cache_dir);
+  prepare_alignment_cache(entries, alignment_cache_dir, parallelism);
   const AlignmentData alignment =
       compute_alignment_from_entries(entries, alignment_cache_dir, parallelism, "auto alignment");
   write_alignment_json(alignment_path, entries, alignment);
